@@ -1,0 +1,20 @@
+{application, arizona_roadrunner, [
+    {description, "Roadrunner HTTP/WS adapter for Arizona"},
+    {vsn, semver},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib,
+        arizona,
+        roadrunner
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [
+        {"GitHub", "https://github.com/arizona-framework/arizona_roadrunner"},
+        {"Docs", "https://hexdocs.pm/arizona_roadrunner"},
+        {"Issues", "https://github.com/arizona-framework/arizona_roadrunner/issues"},
+        {"Arizona", "https://github.com/arizona-framework/arizona"}
+    ]}
+]}.
