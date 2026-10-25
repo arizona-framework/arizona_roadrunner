@@ -6,9 +6,9 @@ server-side render.
 Wired up by `arizona_roadrunner_router` for every Arizona route. The
 handler delegates the full render pipeline (wrap roadrunner req in an
 `arizona_req:request()`, run middlewares, call
-`arizona_render:render_view_to_iolist/3`, handle crashes + stashed
-hot-reload compile errors) to `arizona_http:render/3`, and translates
-its result into roadrunner's `{Response, Req}` reply shape.
+`arizona_render:render_view/2`, handle crashes + stashed
+hot-reload compile errors) to `arizona_http:reply/3`, and maps
+its result onto roadrunner's `{Response, Req}` reply shape.
 """.
 
 -behaviour(roadrunner_handler).
@@ -25,7 +25,7 @@ its result into roadrunner's `{Response, Req}` reply shape.
 
 -doc """
 Roadrunner `handle/1` callback. Renders the configured Arizona
-handler and replies with HTML.
+handler and replies with the document under its render target's media type.
 """.
 -spec handle(Req) -> {Response, Req} when
     Req :: roadrunner_req:request(),
@@ -33,17 +33,14 @@ handler and replies with HTML.
 handle(Req) ->
     #{arizona := State} = roadrunner_req:state(Req),
     #{handler := H} = State,
-    ArzReq = arizona_roadrunner_req:new(Req),
-    case arizona_http:render(H, ArzReq, State) of
-        {halt, RawReq} ->
-            %% Middleware emitted its own response via direct roadrunner
-            %% calls (rare). Pass through as a 204 to satisfy the result
-            %% shape; the middleware should have already shipped bytes.
-            {roadrunner_resp:no_content(), RawReq};
-        {redirect, Status, Location} ->
-            {roadrunner_resp:redirect(Status, Location), Req};
-        {ok, Status, Body} ->
-            {roadrunner_resp:html(Status, Body), Req};
-        {error, Status, Body} ->
-            {roadrunner_resp:html(Status, Body), Req}
-    end.
+    %% Hand roadrunner back the *threaded* raw request, never the one we came in
+    %% with. Reading the body mutates the raw req in `body_buffering => manual`
+    %% mode (it advances the body_reader), and roadrunner's finishing phase
+    %% drains the reader off whatever req the handler returns -- give it the
+    %% stale one and it re-reads the already consumed body out of the next
+    %% pipelined request, corrupting keep-alive framing.
+    {Status, Headers, Body, ArzReq1} = arizona_http:reply(
+        H, arizona_roadrunner_req:new(Req), State
+    ),
+    ContentLength = {~"content-length", integer_to_binary(iolist_size(Body))},
+    {{Status, Headers ++ [ContentLength], Body}, arizona_req:raw(ArzReq1)}.
