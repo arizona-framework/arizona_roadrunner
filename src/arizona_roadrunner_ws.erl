@@ -7,7 +7,7 @@ Translates roadrunner's split handler model (upgrade-time
 transport-agnostic `arizona_socket` API:
 
 - `handle/1` -- the `roadrunner_handler` callback. Delegates the
-  upgrade-time handshake to `arizona_ws:prepare/3` (parse
+  upgrade-time handshake to `arizona_ws:upgrade/3` (parse
   `_az_path`/`_az_reconnect`, resolve the route via
   `arizona_roadrunner_req`, run middlewares) and returns either a
   plain HTTP halt reply or a `{websocket, ?MODULE, State}` upgrade
@@ -52,25 +52,29 @@ middlewares, and returns the websocket upgrade tuple.
     Req :: roadrunner_req:request(),
     Response :: roadrunner_handler:response().
 handle(Req) ->
-    QS = roadrunner_req:parse_qs(Req),
-    case arizona_ws:prepare(QS, arizona_roadrunner_req, Req) of
-        {halt, HaltReq} ->
-            {halt_response(HaltReq), arizona_req:raw(HaltReq)};
-        {cont, State} ->
-            {{websocket, ?MODULE, State}, Req}
+    case arizona_ws:upgrade(roadrunner_req:parse_qs(Req), arizona_roadrunner_req, Req) of
+        {reply, Status, Headers, Raw} ->
+            {{Status, Headers ++ [{~"content-length", ~"0"}], <<>>}, Raw};
+        {upgrade, [], State} ->
+            {{websocket, ?MODULE, State}, Req};
+        {upgrade, Headers, State} ->
+            %% What the route's middlewares stashed rides the 101.
+            {{websocket, ?MODULE, State, Headers}, Req}
     end.
 
 -doc """
 `roadrunner_ws_handler` `init/1` callback. Builds the Arizona socket
 and starts the live process. On reconnect, returns the page snapshot
-as the first outbound text frame.
+as the first outbound text frame -- unless the client flagged
+`_az_fps_follow`, in which case the socket defers the snapshot until
+the client's `cached_fps` frame arrives so the payload dedups against
+the announced fingerprints.
 """.
 -spec init(State) -> Result when
     State :: map(),
     Result :: roadrunner_ws_handler:result().
-init(#{handler := H, bindings := IB, on_mount := OM, req := ArzReq, reconnect := R} = State) ->
-    Opts = #{reconnect => R, on_mount => OM},
-    to_roadrunner(arizona_socket:init(H, IB, ArzReq, Opts), State).
+init(State) ->
+    to_roadrunner(arizona_ws:init(State), State).
 
 -doc """
 Roadrunner `handle_frame/2` callback. Forwards text frames to the
@@ -87,7 +91,7 @@ handle_frame(_Frame, State) ->
 
 -doc """
 Roadrunner `handle_info/2` callback. Forwards mailbox messages
-(typically `{arizona_push, Ops, Effects}` from the live process) to
+(typically `{arizona_push, ViewId, Ops, Effects, Observed}` from the live process) to
 `arizona_socket:handle_info/2`.
 """.
 -spec handle_info(Msg, State) -> Result when
@@ -110,14 +114,7 @@ alive past drain.
     Result :: roadrunner_ws_handler:result().
 handle_drain(Deadline, #{socket := Sock, req := Req} = State) ->
     ok = roadrunner:acknowledge_drain(arizona_req:raw(Req), Deadline),
-    ok =
-        case arizona_socket:live_pid(Sock) of
-            undefined ->
-                ok;
-            Pid ->
-                Pid ! {arizona_drain, Deadline},
-                ok
-        end,
+    ok = arizona_socket:drain(Sock, Deadline),
     {ok, State}.
 
 %% --------------------------------------------------------------------
@@ -128,13 +125,10 @@ to_roadrunner({ok, Sock}, State) ->
     {ok, State#{socket => Sock}};
 to_roadrunner({reply, Data, Sock}, State) ->
     {reply, [{text, Data}], State#{socket => Sock}};
+to_roadrunner({reply_many, Frames, Sock}, State) ->
+    %% Multiple ordered frames from one inbound frame -- e.g. a deferred
+    %% reconnect resync flushed by a non-`cached_fps` frame ships the resync
+    %% first, then that frame's own reply.
+    {reply, [{text, Data} || Data <- Frames], State#{socket => Sock}};
 to_roadrunner({close, Code, Reason, Sock}, State) ->
     {close, Code, Reason, State#{socket => Sock}}.
-
-%% Middleware halted before the upgrade — emit a stashed redirect or a
-%% bare 400 if the middleware did not write its own response.
-halt_response(HaltReq) ->
-    case arizona_req:halted_redirect(HaltReq) of
-        {Status, Location} -> roadrunner_resp:redirect(Status, Location);
-        undefined -> roadrunner_resp:bad_request()
-    end.
