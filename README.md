@@ -21,8 +21,8 @@ a cycle).
 
 ```erlang
 {deps, [
-    {arizona, "~> 0.4"},
-    {arizona_roadrunner, "~> 0.1"}
+    arizona,
+    arizona_roadrunner
 ]}.
 ```
 
