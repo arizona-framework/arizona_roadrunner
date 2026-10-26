@@ -22,7 +22,7 @@ transport-agnostic `arizona_socket` API:
   `arizona_socket:handle_info/2`.
 - `handle_drain/2` -- fires when the listener broadcasts a drain
   signal (`roadrunner_listener:drain/2` or `notify_drain/2`). Emits
-  the telemetry ack and notifies the live process via
+  the drain acknowledgement and notifies the live process via
   `{arizona_drain, Deadline}` so the view can wind down gracefully
   (close the WS, push a reconnect indicator, etc.).
 """.
@@ -102,7 +102,7 @@ handle_info(Msg, #{socket := Sock} = State) ->
     to_roadrunner(arizona_socket:handle_info(Msg, Sock), State).
 
 -doc """
-Roadrunner `handle_drain/2` callback. Emits the telemetry ack and
+Roadrunner `handle_drain/2` callback. Emits the drain acknowledgement and
 forwards an adapter-agnostic `{arizona_drain, Deadline}` to the live
 process so the view's optional `handle_drain/2` callback can run and
 choose to push a "reconnecting" indicator, close the WS, or stay
