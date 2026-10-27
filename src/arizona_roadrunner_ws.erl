@@ -16,7 +16,7 @@ transport-agnostic `arizona_socket` API:
   Constructs the Arizona socket and starts the live process; the
   reconnect path can immediately reply with the rendered page.
 - `handle_frame/2` -- forwards inbound text frames to
-  `arizona_socket:handle_in/2`; ignores binary, ping, and pong frames.
+  `arizona_socket:handle_in/2`; ignores binary frames.
 - `handle_info/2` -- forwards mailbox messages (typically
   `{arizona_push, ...}` from the live process) to
   `arizona_socket:handle_info/2`.
@@ -78,7 +78,7 @@ init(State) ->
 
 -doc """
 Roadrunner `handle_frame/2` callback. Forwards text frames to the
-socket; ignores binary, ping, and pong frames.
+socket; ignores binary frames.
 """.
 -spec handle_frame(Frame, State) -> Result when
     Frame :: roadrunner_ws:frame(),
