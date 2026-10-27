@@ -59,7 +59,7 @@ handle(Req) ->
             {{websocket, ?MODULE, State}, Req};
         {upgrade, Headers, State} ->
             %% What the route's middlewares stashed rides the 101.
-            {{websocket, ?MODULE, State, Headers}, Req}
+            {{websocket, ?MODULE, State, #{headers => Headers}}, Req}
     end.
 
 -doc """
