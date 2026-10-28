@@ -1,8 +1,8 @@
 {"1.2.0",
-[{<<"roadrunner">>,{pkg,<<"roadrunner">>,<<"0.12.1">>},0}]}.
+[{<<"roadrunner">>,{pkg,<<"roadrunner">>,<<"0.13.0">>},0}]}.
 [
 {pkg_hash,[
- {<<"roadrunner">>, <<"5D5C5F456332893D4446B8E5DB28C3F9ADC7C711E6A58A177075E024E3E66E1E">>}]},
+ {<<"roadrunner">>, <<"8BEE5CD2AEECD86428EC54326BF3CD6EB3903A4DE8741CA52EA6816FAF1E3F49">>}]},
 {pkg_hash_ext,[
- {<<"roadrunner">>, <<"EA5E0AC859E4CBB1F8AFF8FA31B35C4C53DE8C57BBB867162C056CEB865B8E9F">>}]}
+ {<<"roadrunner">>, <<"316D24D60B69BF79C9FCA40FBD2C6FC1AEA0E1595F86D66B136E7BD35CFA2727">>}]}
 ].
