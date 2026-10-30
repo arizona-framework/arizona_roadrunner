@@ -17,8 +17,9 @@ routes take effect without restarting the listener.
 ## Options
 
 - `routes` -- list of `t:arizona_roadrunner_router:route/0` (required)
-- `error_page` -- `{Module, Function}` to render the dev error page
-  (default `{arizona_error_page, render}`)
+- `error_page` -- `{Module, Function}` template rendered on a page crash
+  in dev. Unset by default: a dev crash is then served as plain text; set
+  `{arizona_error_page, render}` for Arizona's HTML dev page
 - `scheme` -- `http` (default) or `https`
 - `tls` -- `[ssl:tls_server_option()]`. Supplying it turns the listener
   into an HTTPS one, so `scheme => https` is optional sugar; pairing it
@@ -249,13 +250,13 @@ start_new(Name, Opts0) ->
     %% `Routes` is unchanged; it is idempotent, so a caller that already resolved
     %% loses nothing.
     #{routes := Routes} = Opts = arizona_config:resolve(Opts0),
-    %% Thread the listener's `error_page` through BuildOpts so it is baked into
-    %% each live route's state (read back by `arizona_http` on a render crash),
-    %% rather than a single global term two listeners would fight over.
-    BuildOpts = #{
-        compress => maps:get(compress, Opts, true),
-        error_page => maps:get(error_page, Opts, {arizona_error_page, render})
-    },
+    %% Thread the listener's `error_page`, only when it sets one, through
+    %% BuildOpts so it is baked into each live route's state (read back by
+    %% `arizona_http` on a render crash), rather than a single global term two
+    %% listeners would fight over.
+    BuildOpts = maps:merge(
+        #{compress => maps:get(compress, Opts, true)}, maps:with([error_page], Opts)
+    ),
     Port = port_from_opts(Opts),
     UserProtoOpts = maps:get(proto_opts, Opts, #{}),
     %% Build the route table and validate (and inject) TLS before any
