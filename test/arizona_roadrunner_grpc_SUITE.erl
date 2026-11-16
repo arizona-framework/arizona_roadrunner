@@ -256,20 +256,29 @@ a_broken_middleware_edit_keeps_both_tables(Config) when is_list(Config) ->
         routes => [{grpc, [arizona_roadrunner_grpc_reloaded], #{}}]
     }),
     try
-        Before = persistent_term:get({arizona_roadrunner_dispatch, grpc_mw_reload}),
+        Before = tables(grpc_mw_reload),
         %% The service gains a method, and the middleware's `init/1` now raises.
         ok = load_service(Config, [{say, say}, {extra, say}]),
         ok = load_middleware(Config, ~"error(broken)"),
         ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
-        ?assertEqual(Before, persistent_term:get({arizona_roadrunner_dispatch, grpc_mw_reload})),
+        ?assertEqual(Before, tables(grpc_mw_reload)),
         ok = load_middleware(Config, ~"ok"),
         ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
-        ?assertNotEqual(
-            Before, persistent_term:get({arizona_roadrunner_dispatch, grpc_mw_reload})
-        )
+        {DispatchBefore, ListenerBefore} = Before,
+        {DispatchAfter, ListenerAfter} = tables(grpc_mw_reload),
+        ?assertNotEqual(DispatchBefore, DispatchAfter),
+        ?assertNotEqual(ListenerBefore, ListenerAfter)
     after
         ok = arizona_roadrunner_server:stop(grpc_mw_reload)
     end.
+
+%% The adapter's dispatch (what a live navigate resolves against) and
+%% roadrunner's own table of the listener `Name` (what a request hits).
+tables(Name) ->
+    {
+        persistent_term:get({arizona_roadrunner_dispatch, Name}),
+        persistent_term:get({roadrunner_routes, Name})
+    }.
 
 %% A logger handler forwarding each event's level and rendered message.
 log(#{level := Level, msg := Msg}, #{config := #{pid := Pid}}) ->

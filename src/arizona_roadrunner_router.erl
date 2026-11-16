@@ -179,7 +179,7 @@ live and recompile flows share the same expansion logic.
 routes(Routes) ->
     routes(Routes, #{}).
 
--doc "Like `routes/1` with build-time opts (see `compile_routes/2`).".
+-doc "Like `routes/1` with build-time opts (see `compile_routes/3`).".
 -spec routes(Routes, BuildOpts) -> [roadrunner_router:route()] when
     Routes :: [route()],
     BuildOpts :: map().
