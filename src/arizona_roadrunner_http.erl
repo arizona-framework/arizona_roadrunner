@@ -33,12 +33,11 @@ handler and replies with the document under its render target's media type.
 handle(Req) ->
     #{arizona := State} = roadrunner_req:state(Req),
     #{handler := H} = State,
-    %% Hand roadrunner back the *threaded* raw request, never the one we came in
-    %% with. Reading the body mutates the raw req in `body_buffering => manual`
-    %% mode (it advances the body_reader), and roadrunner's finishing phase
-    %% drains the reader off whatever req the handler returns -- give it the
-    %% stale one and it re-reads the already consumed body out of the next
-    %% pipelined request, corrupting keep-alive framing.
+    %% Hand roadrunner back the *threaded* raw request, as its handler contract
+    %% asks: in `body_buffering => manual` mode reading the body advances the
+    %% raw req's body_reader. Roadrunner also remembers the latest reader
+    %% itself and drains from it, so an older req no longer re-reads a
+    %% consumed body out of the next pipelined request.
     {Status, Headers, Body, ArzReq1} = arizona_http:reply(
         H, arizona_roadrunner_req:new(Req), State
     ),
