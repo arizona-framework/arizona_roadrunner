@@ -1,0 +1,222 @@
+-module(arizona_roadrunner_grpc_SUITE).
+-moduledoc """
+The `{grpc, Services, Opts}` route: gRPC services served by `roadrunner_grpc`
+on the same listener and port as the Arizona routes.
+""".
+-include_lib("stdlib/include/assert.hrl").
+
+-export([all/0]).
+-export([init_per_suite/1]).
+-export([end_per_suite/1]).
+
+-export([expands_to_roadrunner_grpc_routes/1]).
+-export([serves_a_call_beside_an_arizona_route/1]).
+-export([passes_its_options_to_roadrunner/1]).
+-export([answers_http1_with_505/1]).
+-export([survives_a_route_recompile/1]).
+-export([streams_beside_a_manual_body_read/1]).
+-export([refuses_a_listener_without_http2/1]).
+-export([refuses_a_bad_shape/1]).
+
+all() ->
+    [
+        expands_to_roadrunner_grpc_routes,
+        serves_a_call_beside_an_arizona_route,
+        passes_its_options_to_roadrunner,
+        answers_http1_with_505,
+        survives_a_route_recompile,
+        streams_beside_a_manual_body_read,
+        refuses_a_listener_without_http2,
+        refuses_a_bad_shape
+    ].
+
+init_per_suite(Config) ->
+    {ok, _} = application:ensure_all_started(arizona),
+    Config.
+
+end_per_suite(Config) when is_list(Config) ->
+    ok = application:stop(arizona).
+
+%% --------------------------------------------------------------------
+%% Cases
+%% --------------------------------------------------------------------
+
+%% One route per service, plus the health service when asked for, each served
+%% by `roadrunner_grpc` rather than an Arizona handler.
+expands_to_roadrunner_grpc_routes(Config) when is_list(Config) ->
+    Routes = arizona_roadrunner_router:routes(
+        [{grpc, [arizona_roadrunner_grpc_echo], #{health => true}}], #{}
+    ),
+    ?assertEqual(
+        [~"/grpc.health.v1.Health/:method", ~"/test.Echo/:method"],
+        lists:sort([Path || #{path := Path, handler := roadrunner_grpc} <- Routes])
+    ),
+    ?assertEqual(2, length(Routes)).
+
+%% A gRPC call and a plain HTTP/1.1 request reach the same plain-TCP port.
+serves_a_call_beside_an_arizona_route(Config) when is_list(Config) ->
+    with_listener(#{}, fun(Port) ->
+        {_Headers, Messages, Trailers, _C} = arizona_roadrunner_grpc_client:call(
+            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Echo/Say", [~"hi"]
+        ),
+        ?assertEqual([~"echo: hi"], Messages),
+        ?assertEqual({~"grpc-status", ~"0"}, lists:keyfind(~"grpc-status", 1, Trailers)),
+        ?assertMatch({200, ~"hello"}, http1(Port, ~"GET", ~"/hello", <<>>))
+    end).
+
+%% `health => true` reaches roadrunner: its health service answers SERVING.
+passes_its_options_to_roadrunner(Config) when is_list(Config) ->
+    with_listener(#{}, fun(Port) ->
+        {_Headers, Messages, _Trailers, _C} = arizona_roadrunner_grpc_client:call(
+            arizona_roadrunner_grpc_client:open(Port), 1, ~"/grpc.health.v1.Health/Check", [<<>>]
+        ),
+        %% HealthCheckResponse{status = SERVING}: field 1, varint 1.
+        ?assertEqual([<<8, 1>>], Messages)
+    end).
+
+%% The gRPC path is `roadrunner_grpc`'s, not an Arizona route's: over
+%% HTTP/1.1 it answers 505, as gRPC needs HTTP/2.
+answers_http1_with_505(Config) when is_list(Config) ->
+    with_listener(#{}, fun(Port) ->
+        ?assertMatch({505, _}, http1(Port, ~"POST", ~"/test.Echo/Say", <<>>))
+    end).
+
+%% A dev hot reload rebuilds the listener's table from the stashed routes, the
+%% gRPC route included.
+survives_a_route_recompile(Config) when is_list(Config) ->
+    with_listener(#{}, fun(Port) ->
+        ok = arizona_roadrunner_server:recompile_routes(),
+        {_Headers, Messages, _Trailers, _C} = arizona_roadrunner_grpc_client:call(
+            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Echo/Say", [~"again"]
+        ),
+        ?assertEqual([~"echo: again"], Messages)
+    end).
+
+%% Under `body_buffering => manual` a bidirectional call answers each request
+%% as it arrives, and an Arizona controller on the same listener still reads
+%% its whole body.
+streams_beside_a_manual_body_read(Config) when is_list(Config) ->
+    with_listener(#{body_buffering => manual}, fun(Port) ->
+        C0 = arizona_roadrunner_grpc_client:start(
+            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Echo/Chat", []
+        ),
+        C1 = arizona_roadrunner_grpc_client:send(
+            C0, 1, iolist_to_binary(roadrunner_grpc_frame:encode(false, ~"one"))
+        ),
+        %% Answered before the client ends its requests: the call streams.
+        {Data, C3} = first_data(C1, 1),
+        ?assertEqual([~"one"], arizona_roadrunner_grpc_client:messages(Data)),
+        C4 = arizona_roadrunner_grpc_client:finish(C3, 1),
+        {_Trailers, _C5} = arizona_roadrunner_grpc_client:trailers(C4, 1),
+        ?assertMatch({200, ~"got: a body"}, http1(Port, ~"POST", ~"/body", ~"a body"))
+    end).
+
+%% Over HTTP/1.1 alone every call would be answered 505, so the start fails
+%% naming the fix, and leaves no routes behind.
+refuses_a_listener_without_http2(Config) when is_list(Config) ->
+    Opts = #{
+        transport_opts => [{port, pick_port()}],
+        routes => [{grpc, [arizona_roadrunner_grpc_echo], #{}}]
+    },
+    ?assertError({grpc_requires_http2, [http1]}, arizona_roadrunner_server:start(grpc_h1, Opts)),
+    ?assertError(
+        {grpc_requires_http2, [http1]},
+        arizona_roadrunner_server:start(grpc_h1, Opts#{proto_opts => #{protocols => [http1]}})
+    ),
+    ?assertEqual(undefined, persistent_term:get({arizona_roadrunner_routes, grpc_h1}, undefined)),
+    Message = format(fun() -> arizona_roadrunner_server:start(grpc_h1, Opts) end),
+    ?assertNotEqual(nomatch, binary:match(Message, ~"add http2 to proto_opts.protocols")).
+
+%% A gRPC route takes a list of services and a map of the other options;
+%% anything else is refused naming the shape, before the listener exists.
+refuses_a_bad_shape(Config) when is_list(Config) ->
+    Start = fun(Route) ->
+        arizona_roadrunner_server:start(grpc_bad, #{
+            transport_opts => [{port, pick_port()}],
+            proto_opts => #{protocols => [http1, http2]},
+            routes => [Route]
+        })
+    end,
+    [
+        ?assertError({invalid_grpc_route, Route}, Start(Route))
+     || Route <- [
+            {grpc, arizona_roadrunner_grpc_echo, #{}},
+            {grpc, [arizona_roadrunner_grpc_echo], []},
+            {grpc, [arizona_roadrunner_grpc_echo], #{services => [arizona_roadrunner_grpc_echo]}}
+        ]
+    ],
+    ?assertEqual(undefined, persistent_term:get({arizona_roadrunner_routes, grpc_bad}, undefined)),
+    Message = format(fun() -> Start({grpc, arizona_roadrunner_grpc_echo, #{}}) end),
+    ?assertNotEqual(nomatch, binary:match(Message, ~"is not a gRPC route")).
+
+%% --------------------------------------------------------------------
+%% Helpers
+%% --------------------------------------------------------------------
+
+%% A plain-TCP listener serving HTTP/1.1 and prior-knowledge HTTP/2, with the
+%% echo service before an Arizona controller.
+with_listener(ProtoOpts, Fun) ->
+    Port = pick_port(),
+    {ok, _} = arizona_roadrunner_server:start(grpc_test, #{
+        transport_opts => [{port, Port}],
+        proto_opts => ProtoOpts#{protocols => [http1, http2]},
+        routes => [
+            {grpc, [arizona_roadrunner_grpc_echo], #{health => true}},
+            {get, ~"/hello", arizona_roadrunner_smoke_controller, #{state => #{body => ~"hello"}}},
+            {post, ~"/body", arizona_roadrunner_grpc_body, #{state => #{prefix => ~"got: "}}}
+        ]
+    }),
+    try
+        Fun(Port)
+    after
+        ok = arizona_roadrunner_server:stop(grpc_test)
+    end.
+
+%% A port the OS just handed out, so parallel runs do not collide.
+pick_port() ->
+    {ok, Listen} = gen_tcp:listen(0, [{reuseaddr, true}]),
+    {ok, Port} = inet:port(Listen),
+    ok = gen_tcp:close(Listen),
+    Port.
+
+%% One HTTP/1.1 request on its own connection: the status and the body.
+http1(Port, Method, Path, Body) ->
+    {ok, Sock} = gen_tcp:connect("localhost", Port, [binary, {active, false}]),
+    ok = gen_tcp:send(Sock, [
+        Method,
+        ~" ",
+        Path,
+        ~" HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n",
+        ~"content-length: ",
+        integer_to_binary(byte_size(Body)),
+        ~"\r\n\r\n",
+        Body
+    ]),
+    Response = recv_all(Sock, <<>>),
+    ok = gen_tcp:close(Sock),
+    [Head, ResponseBody] = binary:split(Response, ~"\r\n\r\n"),
+    <<"HTTP/1.1 ", Code:3/binary, _/binary>> = Head,
+    {binary_to_integer(Code), ResponseBody}.
+
+recv_all(Sock, Acc) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, Data} -> recv_all(Sock, <<Acc/binary, Data/binary>>);
+        {error, closed} -> Acc
+    end.
+
+%% The first DATA frame the server sends on `StreamId`, skipping the frames
+%% before it (settings, window updates, the response headers).
+first_data(C0, StreamId) ->
+    case arizona_roadrunner_grpc_client:next_frame(C0) of
+        {{data, StreamId, _Flags, Data, _FlowLen}, C} -> {Data, C};
+        {_Other, C} -> first_data(C, StreamId)
+    end.
+
+%% The message `erl_error` renders for what `Fun` raises.
+format(Fun) ->
+    try Fun() of
+        Result -> error({no_error, Result})
+    catch
+        Class:Reason:Stacktrace ->
+            unicode:characters_to_binary(erl_error:format_exception(Class, Reason, Stacktrace))
+    end.

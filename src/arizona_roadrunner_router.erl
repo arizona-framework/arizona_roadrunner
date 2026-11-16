@@ -23,9 +23,18 @@ reload without restarting the listener.
 | `{match, Spec, Path, Handler, Opts}` | Multi/custom methods | `arizona_roadrunner_controller` |
 | `{mcp, Path, Handler, Opts}` | MCP server | `arizona_roadrunner_controller` |
 | `{reload, Path, Opts}` | Dev SSE reload endpoint | `arizona_roadrunner_controller` |
+| `{grpc, Services, Opts}` | gRPC services | `roadrunner_grpc` |
 
 `Verb` is `get`/`post`/`put`/`patch`/`delete`/`head`/`options`; `match`'s `Spec` is a
 single verb, a list of verbs, a custom uppercase method binary, or `'*'` (any method).
+
+A `{grpc, Services, Opts}` route is this adapter's own: core and other adapters
+refuse it as `unknown_route`. It expands to `roadrunner_grpc:routes/1` with
+`Services` as its `services`: one route per service at `/package.Service/:method`,
+plus the health and reflection services when `Opts` asks for them. `Opts` takes
+every other `roadrunner_grpc:routes/1` option, and runs no Arizona pipeline: a gRPC
+client sends no `Origin`, and gRPC compresses its own messages. A bad shape raises
+`invalid_grpc_route`. See `arizona_roadrunner_server` for what the listener needs.
 
 An `{asset, ...}` route answers GET and HEAD only (plus `OPTIONS` when it carries a
 CORS transform, for the preflight); any other method gets `405` + `Allow`.
@@ -72,6 +81,8 @@ so a listener start can build and validate its table before writing anything.
 %% --------------------------------------------------------------------
 
 -export_type([route/0]).
+-export_type([grpc_service/0]).
+-export_type([grpc_opts/0]).
 
 %% --------------------------------------------------------------------
 %% Macros
@@ -85,8 +96,24 @@ so a listener start can build and validate its table before writing anything.
 %% Types definitions
 %% --------------------------------------------------------------------
 
-%% The routes this adapter serves: core's (`t:arizona_route:route/0`).
--nominal route() :: arizona_route:route().
+%% The routes this adapter serves: core's (`t:arizona_route:route/0`), and
+%% its own gRPC route.
+-nominal route() :: arizona_route:route() | {grpc, [grpc_service()], grpc_opts()}.
+
+%% A gRPC service: a `roadrunner_grpc_service` module, or a descriptor map of
+%% a service built at runtime.
+-nominal grpc_service() :: module() | roadrunner_grpc_service:descriptor().
+
+%% The options of `roadrunner_grpc:routes/1` other than `services`, which the
+%% route carries itself.
+-nominal grpc_opts() :: #{
+    codecs => [module()],
+    max_message_size => pos_integer(),
+    max_content_length => non_neg_integer(),
+    send_compression => roadrunner_grpc:encoding(),
+    health => boolean(),
+    reflection => boolean()
+}.
 
 %% --------------------------------------------------------------------
 %% API Functions
@@ -144,7 +171,7 @@ routes(Routes) ->
 routes(Routes, BuildOpts) when is_map(BuildOpts) ->
     %% Roadrunner serves every route kind, so classifying only refuses a term
     %% that is no route, naming the valid shapes.
-    ok = lists:foreach(fun(R) -> true = is_atom(arizona_route:kind(R)) end, Routes),
+    ok = lists:foreach(fun check_route/1, Routes),
     open_cors_options(lists:flatmap(fun(R) -> route_to_roadrunner(R, BuildOpts) end, Routes)).
 
 -doc """
@@ -197,11 +224,33 @@ format_error(
             "the cors transform from route #~b.",
             [CorsPos, CorsPath, ShadowedPos, ShadowedPath, CorsPos, CorsPos]
         )
+    };
+format_error({invalid_grpc_route, Route}, [{_M, _F, _Args, _Info} | _]) ->
+    #{
+        general => io_lib:format(
+            "~0tp is not a gRPC route. A gRPC route is {grpc, Services, Opts}: "
+            "Services a list of roadrunner_grpc_service modules or descriptor maps, "
+            "Opts a map of the other roadrunner_grpc:routes/1 options (services "
+            "goes in the tuple, not in Opts).",
+            [Route]
+        )
     }.
 
 %% --------------------------------------------------------------------
 %% Internal functions
 %% --------------------------------------------------------------------
+
+%% The gRPC route is this adapter's own, so it is checked here: core's `kind/1`
+%% would refuse it as no route.
+check_route({grpc, Services, Opts}) when
+    is_list(Services), is_map(Opts), not is_map_key(services, Opts)
+->
+    ok;
+check_route({grpc, _Services, _Opts} = Route) ->
+    erlang:error({invalid_grpc_route, Route}, [Route], [{error_info, #{module => ?MODULE}}]);
+check_route(Route) ->
+    true = is_atom(arizona_route:kind(Route)),
+    ok.
 
 %% Arizona's per-route data lives under the `arizona` key inside the
 %% route's `state` so roadrunner's pipeline does not interpret arizona's
@@ -242,6 +291,8 @@ route_to_roadrunner({asset, Path, _Source, Opts} = Route, BuildOpts) ->
             state => asset_state(arizona_route:asset_dir(Route), Opts)
         })
     ];
+route_to_roadrunner({grpc, Services, Opts}, _BuildOpts) ->
+    roadrunner_grpc:routes(Opts#{services => Services});
 route_to_roadrunner(Route, BuildOpts) ->
     %% A controller (verb tag or `{match, ...}`), or the MCP or dev reload
     %% endpoint, which are ones too; `arizona_roadrunner_controller` runs

@@ -70,7 +70,37 @@ arizona_roadrunner_server:start(arizona_http, #{
 
 Roadrunner negotiates the protocol per connection from the ALPN
 offer; HTTP/1.1 clients still work on the same listener. Default
-when `protocols` is omitted is `[http1]` (HTTP/1.1 only).
+when `protocols` is omitted is `[http1]` (HTTP/1.1 only). Without TLS,
+`[http1, http2]` serves HTTP/1.1 and prior-knowledge HTTP/2 (h2c) on one
+port, told apart by the HTTP/2 connection preface.
+
+## Serving gRPC
+
+A `{grpc, Services, Opts}` route (`arizona_roadrunner_router`) serves gRPC
+services beside the Arizona routes, on the same listener and port:
+
+```erlang
+arizona_roadrunner_server:start(arizona_http, #{
+    routes => [
+        {grpc, [chat_service], #{health => true, reflection => true}},
+        {live, ~"/", home_view, #{}},
+        {ws, ~"/ws", #{}}
+    ],
+    proto_opts => #{protocols => [http1, http2]}
+}).
+```
+
+- gRPC needs HTTP/2 or HTTP/3: a listener with a gRPC route and neither in
+  `protocols` refuses to start (`grpc_requires_http2`).
+- List the gRPC route before any catch-all route: routes match in order, and
+  roadrunner refuses a route an earlier one shadows.
+- `body_buffering` is a listener option. Under the default `auto`, unary and
+  server-streaming calls work, and a client or bidirectional stream sees its
+  requests only once the client has sent them all. `proto_opts =>
+  #{body_buffering => manual}` streams them as they arrive, and makes every
+  Arizona route on the listener read its request body as it arrives too.
+- The services are written against `roadrunner_grpc` (see roadrunner's gRPC
+  guide); a method reaches live views through `arizona_pubsub`.
 """.
 
 %% --------------------------------------------------------------------
@@ -225,6 +255,16 @@ format_error(tls_with_http_scheme, [{_M, _F, _Args, _Info} | _]) ->
             "tls => [...] implies https; drop scheme => http (or drop tls) "
             "instead of serving the configured certs' traffic in cleartext"
     };
+format_error({grpc_requires_http2, Protocols}, _ST) ->
+    #{
+        general =>
+            io_lib:format(
+                "a {grpc, ...} route needs HTTP/2 or HTTP/3, but the listener serves "
+                "~0tp: add http2 to proto_opts.protocols ([http1, http2] serves both "
+                "on one port). Over HTTP/1.1 every gRPC call is answered 505.",
+                [Protocols]
+            )
+    };
 format_error({unsupported_transport_opt, Opt}, _ST) ->
     #{
         general =>
@@ -269,7 +309,28 @@ start_new(Name, Opts0) ->
         },
         Opts
     ),
+    ok = check_grpc_protocols(Routes, maps:get(protocols, ListenerOpts, [http1])),
     start_listener(Name, ListenerOpts, {Routes, BuildOpts}).
+
+%% gRPC runs over HTTP/2 or HTTP/3 only: over HTTP/1.1 every call would be
+%% answered `505`, so a listener that serves neither refuses a gRPC route.
+check_grpc_protocols(Routes, Protocols) ->
+    case
+        lists:any(fun(Route) -> element(1, Route) =:= grpc end, Routes) andalso
+            not lists:any(fun carries_grpc/1, Protocols)
+    of
+        true ->
+            erlang:error(
+                {grpc_requires_http2, Protocols},
+                [Routes, Protocols],
+                [{error_info, #{module => ?MODULE}}]
+            );
+        false ->
+            ok
+    end.
+
+carries_grpc({Protocol, _Opts}) -> carries_grpc(Protocol);
+carries_grpc(Protocol) -> Protocol =:= http2 orelse Protocol =:= http3.
 
 %% The routes are written BEFORE the listener starts so its first WS upgrade
 %% already resolves, which is also why a failed start must put back whatever
