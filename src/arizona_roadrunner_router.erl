@@ -71,13 +71,7 @@ so a listener start can build and validate its table before writing anything.
 %% Types exports
 %% --------------------------------------------------------------------
 
--export_type([path/0]).
 -export_type([route/0]).
--export_type([asset_source/0]).
--export_type([asset_opts/0]).
--export_type([method/0]).
--export_type([method_spec/0]).
--export_type([controller_opts/0]).
 
 %% --------------------------------------------------------------------
 %% Macros
@@ -91,60 +85,8 @@ so a listener start can build and validate its table before writing anything.
 %% Types definitions
 %% --------------------------------------------------------------------
 
--nominal path() :: binary().
-
--nominal route() ::
-    {live, path(), module(), arizona_live:route_opts()}
-    | {ws, path(), map()}
-    | {asset, path(), asset_source()}
-    | {asset, path(), asset_source(), asset_opts()}
-    | {method(), path(), module(), controller_opts()}
-    | {match, method_spec(), path(), module(), controller_opts()}
-    | {mcp, path(), module(), arizona_mcp_handler:route_opts()}
-    | {reload, path(), map()}.
-
-%% Where an `{asset, ...}` route's files live: a directory path, or a
-%% sub-path under an application's `priv` directory.
--nominal asset_source() ::
-    {dir, file:filename_all()}
-    | {priv_dir, atom(), file:filename_all()}.
-
-%% Options for an `{asset, ...}` route. `cache_control` sets a `Cache-Control`
-%% header (verbatim) on every cacheable static response; off by default. Use it
-%% only for content-hashed assets (e.g. `~"public, max-age=31536000, immutable"`)
-%% -- arizona's own bundle filenames are stable, not hashed, so an `immutable`
-%% directive on them would pin a stale build past a deploy.
--nominal asset_opts() :: #{
-    cache_control => binary(),
-    %% HTTP response transforms ONLY (`arizona_middleware:cors/1`, ...): an
-    %% asset route runs no Arizona pipeline, so a request-to-bindings step
-    %% here has nothing to run it and route compilation fails loudly.
-    middlewares => [arizona_middleware:http_transform()]
-}.
-
-%% The verb-tag atoms a controller route may use as its first element
-%% (sugar for a single-method allowlist). Custom or multi-method routes go
-%% through `{match, MethodSpec, ...}`.
--nominal method() :: get | post | put | patch | delete | head | options.
-
-%% The method argument of a `{match, ...}` route: a single verb, a list of
-%% verbs, or the atom `'*'` for any method. A verb is an atom (upper-cased at
-%% compile time -- the common ones are `method()`, but any atom works, e.g.
-%% `move` -> `~"MOVE"`) or a custom uppercase method binary (`~"PROPFIND"`).
--nominal method_spec() :: atom() | binary() | [atom() | binary()].
-
--nominal controller_opts() :: #{
-    %% State handed to the controller action, as its context's `state`.
-    state => term(),
-    %% Controller action function: dispatched as Handler:Action/2 (default `handle`).
-    action => atom(),
-    %% Arizona pipeline steps and HTTP response transforms, split at
-    %% route-compile time (see split_middlewares/1).
-    middlewares => [arizona_middleware:middleware()],
-    %% CSRF Origin check is on by default; set false to opt this route out.
-    check_origin => boolean(),
-    _ => term()
-}.
+%% The routes this adapter serves: core's (`t:arizona_route:route/0`).
+-nominal route() :: arizona_route:route().
 
 %% --------------------------------------------------------------------
 %% API Functions
