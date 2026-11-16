@@ -30,7 +30,7 @@ single verb, a list of verbs, a custom uppercase method binary, or `'*'` (any me
 
 A `{grpc, Services, Opts}` route is this adapter's own: core and other adapters
 refuse it as `unknown_route`. It expands to `roadrunner_grpc:routes/1` with
-`Services` as its `services`: one route per service at `/package.Service/:method`,
+`Services` as its `services`: one POST-only route per service at `/package.Service/:method`,
 plus the health and reflection services when `Opts` asks for them. `Opts` takes
 every other `roadrunner_grpc:routes/1` option, and runs no Arizona pipeline: a gRPC
 client sends no `Origin`, and gRPC compresses its own messages. A bad shape raises

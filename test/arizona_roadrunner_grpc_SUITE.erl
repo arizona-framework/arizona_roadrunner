@@ -169,17 +169,14 @@ accepts_http2_with_options(Config) when is_list(Config) ->
 %% HTTP/3 carries gRPC, so a listener offering it passes the gRPC check and
 %% fails only on roadrunner's own rule that HTTP/3 needs TLS.
 counts_http3_as_carrying_grpc(Config) when is_list(Config) ->
-    Error =
-        try
-            arizona_roadrunner_server:start(grpc_h3, #{
-                transport_opts => [{port, pick_port()}],
-                proto_opts => #{protocols => [http1, http3]},
-                routes => [{grpc, [arizona_roadrunner_grpc_echo], #{}}]
-            })
-        catch
-            error:Reason -> Reason
-        end,
-    ?assertNotMatch({grpc_requires_http2, _}, Error).
+    ?assertMatch(
+        {error, {{{listener_opt_conflict, protocols, _, http3_requires_tls}, _}, _}},
+        arizona_roadrunner_server:start(grpc_h3, #{
+            transport_opts => [{port, pick_port()}],
+            proto_opts => #{protocols => [http1, http3]},
+            routes => [{grpc, [arizona_roadrunner_grpc_echo], #{}}]
+        })
+    ).
 
 %% An earlier route answering POST on every two-segment path would take every
 %% gRPC call; the listener refuses to start instead.
