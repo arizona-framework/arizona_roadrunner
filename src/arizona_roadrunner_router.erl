@@ -60,6 +60,8 @@ so a listener start can build and validate its table before writing anything.
 %% --------------------------------------------------------------------
 
 -export([compile_routes/3]).
+-export([dispatch/2]).
+-export([put_dispatch/2]).
 -export([forget_routes/1]).
 -export([routes/1]).
 -export([routes/2]).
@@ -137,11 +139,24 @@ This is the form the server boot/recompile path uses.
     BuildOpts :: map(),
     Name :: atom().
 compile_routes(Routes, BuildOpts, Name) when is_map(BuildOpts), is_atom(Name) ->
-    persistent_term:put(
-        {?DISPATCH_KEY, Name},
-        roadrunner_router:compile(routes(Routes, BuildOpts), [])
-    ),
-    ok.
+    put_dispatch(Name, dispatch(Routes, BuildOpts)).
+
+-doc """
+Compiles `Routes` into the table `compile_routes/3` stores, without storing it,
+so a caller can store it only once something else has succeeded.
+""".
+-spec dispatch(Routes, BuildOpts) -> roadrunner_router:compiled() when
+    Routes :: [route()],
+    BuildOpts :: map().
+dispatch(Routes, BuildOpts) when is_map(BuildOpts) ->
+    roadrunner_router:compile(routes(Routes, BuildOpts), []).
+
+-doc "Stores a table `dispatch/2` compiled as the listener `Name`'s dispatch.".
+-spec put_dispatch(Name, Dispatch) -> ok when
+    Name :: atom(),
+    Dispatch :: roadrunner_router:compiled().
+put_dispatch(Name, Dispatch) when is_atom(Name) ->
+    persistent_term:put({?DISPATCH_KEY, Name}, Dispatch).
 
 -doc """
 Erases the listener-scoped dispatch key written by `compile_routes/3`.

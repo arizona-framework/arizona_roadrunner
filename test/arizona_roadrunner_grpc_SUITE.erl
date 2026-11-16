@@ -22,6 +22,7 @@ on the same listener and port as the Arizona routes.
 -export([refuses_an_earlier_post_catch_all/1]).
 -export([answers_a_get_with_405/1]).
 -export([a_broken_service_edit_keeps_the_listener_reloadable/1]).
+-export([a_broken_middleware_edit_keeps_both_tables/1]).
 -export([log/2]).
 
 all() ->
@@ -38,7 +39,8 @@ all() ->
         counts_http3_as_carrying_grpc,
         refuses_an_earlier_post_catch_all,
         answers_a_get_with_405,
-        a_broken_service_edit_keeps_the_listener_reloadable
+        a_broken_service_edit_keeps_the_listener_reloadable,
+        a_broken_middleware_edit_keeps_both_tables
     ].
 
 init_per_suite(Config) ->
@@ -211,7 +213,7 @@ answers_a_get_with_405(Config) when is_list(Config) ->
 %% table it had and serves on, the failure is logged, and the reload goes on,
 %% so the browser is still told. Fixing the edit rebuilds it on the next one.
 a_broken_service_edit_keeps_the_listener_reloadable(Config) when is_list(Config) ->
-    ok = load_service(Config, say),
+    ok = load_service(Config, [{say, say}]),
     ok = logger:add_handler(grpc_reload_probe, ?MODULE, #{config => #{pid => self()}}),
     Port = pick_port(),
     {ok, _} = arizona_roadrunner_server:start(grpc_reload, #{
@@ -221,7 +223,7 @@ a_broken_service_edit_keeps_the_listener_reloadable(Config) when is_list(Config)
     }),
     try
         %% Its `rpcs/0` now names a function the module does not export.
-        ok = load_service(Config, gone),
+        ok = load_service(Config, [{say, gone}]),
         ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
         receive
             {logged, error, Message} ->
@@ -232,11 +234,41 @@ a_broken_service_edit_keeps_the_listener_reloadable(Config) when is_list(Config)
             arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Reloaded/Say", [~"still"]
         ),
         ?assertEqual([~"still"], Messages),
-        ok = load_service(Config, say),
+        ok = load_service(Config, [{say, say}]),
         ?assertEqual(ok, arizona_roadrunner_server:recompile_routes())
     after
         ok = arizona_roadrunner_server:stop(grpc_reload),
         ok = logger:remove_handler(grpc_reload_probe)
+    end.
+
+%% A listener middleware's `init/1` runs only as roadrunner rebuilds the
+%% listener's own table. When the reload breaks it, the adapter's dispatch
+%% (what a live navigate resolves against) is not moved on alone: both keep
+%% the routes they had, and move together once the edit is fixed.
+a_broken_middleware_edit_keeps_both_tables(Config) when is_list(Config) ->
+    ok = load_service(Config, [{say, say}]),
+    ok = load_middleware(Config, ~"ok"),
+    {ok, _} = arizona_roadrunner_server:start(grpc_mw_reload, #{
+        transport_opts => [{port, pick_port()}],
+        proto_opts => #{
+            protocols => [http1, http2], middlewares => [arizona_roadrunner_grpc_reloaded_mw]
+        },
+        routes => [{grpc, [arizona_roadrunner_grpc_reloaded], #{}}]
+    }),
+    try
+        Before = persistent_term:get({arizona_roadrunner_dispatch, grpc_mw_reload}),
+        %% The service gains a method, and the middleware's `init/1` now raises.
+        ok = load_service(Config, [{say, say}, {extra, say}]),
+        ok = load_middleware(Config, ~"error(broken)"),
+        ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
+        ?assertEqual(Before, persistent_term:get({arizona_roadrunner_dispatch, grpc_mw_reload})),
+        ok = load_middleware(Config, ~"ok"),
+        ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
+        ?assertNotEqual(
+            Before, persistent_term:get({arizona_roadrunner_dispatch, grpc_mw_reload})
+        )
+    after
+        ok = arizona_roadrunner_server:stop(grpc_mw_reload)
     end.
 
 %% A logger handler forwarding each event's level and rendered message.
@@ -254,24 +286,36 @@ log(#{level := Level, msg := Msg}, #{config := #{pid := Pid}}) ->
 %% Helpers
 %% --------------------------------------------------------------------
 
-%% (Re)load `arizona_roadrunner_grpc_reloaded`, a raw-codec service whose `Say`
-%% method runs `Function`: `say` echoes the request, `gone` is not exported.
-load_service(Config, Function) ->
-    File = filename:join(
-        proplists:get_value(priv_dir, Config), "arizona_roadrunner_grpc_reloaded.erl"
-    ),
-    ok = file:write_file(
-        File,
+%% (Re)load `arizona_roadrunner_grpc_reloaded`, a raw-codec service with a
+%% method per `{Method, Function}` pair; only `say/2` (an echo) is exported, so
+%% naming any other function breaks the service.
+load_service(Config, Methods) ->
+    Rpcs = lists:join(~", ", [
         io_lib:format(
-            "-module(arizona_roadrunner_grpc_reloaded).~n"
-            "-export([name/0, rpcs/0, say/2]).~n"
-            "name() -> <<\"test.Reloaded\">>.~n"
-            "rpcs() -> #{<<\"Say\">> =>~n"
-            "    #{function => ~s, kind => unary, input => b, output => b}}.~n"
-            "say(Message, Stream) -> {reply, Message, Stream}.~n",
-            [Function]
+            "<<\"~ts\">> => #{function => ~s, kind => unary, input => b, output => b}",
+            [string:titlecase(atom_to_list(M)), F]
         )
-    ),
+     || {M, F} <- Methods
+    ]),
+    load(Config, arizona_roadrunner_grpc_reloaded, [
+        "-export([name/0, rpcs/0, say/2]).\n",
+        "name() -> <<\"test.Reloaded\">>.\n",
+        ["rpcs() -> #{", Rpcs, "}.\n"],
+        "say(Message, Stream) -> {reply, Message, Stream}.\n"
+    ]).
+
+%% (Re)load `arizona_roadrunner_grpc_reloaded_mw`, a pass-through listener
+%% middleware whose `init/1` body is `InitBody`.
+load_middleware(Config, InitBody) ->
+    load(Config, arizona_roadrunner_grpc_reloaded_mw, [
+        "-export([init/1, call/3]).\n",
+        ["init(_Config) -> ", InitBody, ".\n"],
+        "call(Req, Next, _State) -> Next(Req).\n"
+    ]).
+
+load(Config, Module, Body) ->
+    File = filename:join(proplists:get_value(priv_dir, Config), atom_to_list(Module) ++ ".erl"),
+    ok = file:write_file(File, [io_lib:format("-module(~s).~n", [Module]) | Body]),
     {ok, Module, Beam} = compile:file(File, [binary]),
     case code:purge(Module) of
         true -> ok;

@@ -221,7 +221,10 @@ Refreshes two tables in lockstep:
 Both must move together — otherwise WS navigate sees new routes
 while a fresh HTTP request still 404s against the listener's stale
 table. A stashed listener that is no longer running is skipped, so it
-cannot stop the others from reloading.
+cannot stop the others from reloading. A listener whose routes fail to
+rebuild (a gRPC service or a listener middleware the reload broke) keeps
+both tables as they were, and the failure is logged: the other listeners
+still reload, and so does the page.
 """.
 -spec recompile_routes() -> ok.
 recompile_routes() ->
@@ -368,17 +371,18 @@ restore_routes(Name, Previous) ->
 %% A listener can be gone while its stash survives (stopped behind
 %% `stop/1`'s back, or its supervisor gave up on it); one such listener must
 %% not abort the reload for every listener after it.
-%% Building a route can run the app's own code (a gRPC service's `rpcs/0`,
-%% through roadrunner's `init_route`), so an edit can break it mid-session.
-%% That listener keeps the table it has and the failure is logged, rather than
-%% the raise stopping the other listeners' reload and the reloader's broadcast.
-%% That code runs as the dispatch table is built, before either table is
-%% written, so the two stay in step.
+%% Rebuilding the routes runs the app's own code (a gRPC service's `rpcs/0`
+%% through roadrunner's `init_route`, a listener middleware's `init/1`), so an
+%% edit can break it mid-session. That listener keeps its tables and the
+%% failure is logged, rather than the raise stopping the other listeners'
+%% reload and the reloader's broadcast. The dispatch is stored only once the
+%% listener took its new table, so the two never disagree.
 recompile_listener(Name, Routes, BuildOpts) ->
     try
-        ok = arizona_roadrunner_router:compile_routes(Routes, BuildOpts, Name),
+        Dispatch = arizona_roadrunner_router:dispatch(Routes, BuildOpts),
         ListenerRoutes = arizona_roadrunner_router:routes(Routes, BuildOpts),
-        ok = reload_listener_routes(Name, ListenerRoutes)
+        ok = reload_listener_routes(Name, ListenerRoutes),
+        ok = arizona_roadrunner_router:put_dispatch(Name, Dispatch)
     catch
         Class:Reason:Stacktrace ->
             logger:error(
