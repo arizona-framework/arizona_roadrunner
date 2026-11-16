@@ -53,6 +53,31 @@ Name the adapter in the `arizona` server env; Arizona has no default:
 Roadrunner speaks HTTP/1.1, HTTP/2 and HTTP/3; set `scheme => https` with a
 `tls` list for TLS. Roadrunner's own listener options go in `proto_opts`.
 
+## gRPC
+
+A `{grpc, Services, Opts}` route serves gRPC services on the same listener and
+port as the Arizona routes. It is this adapter's own route: other adapters
+refuse it.
+
+```erlang
+{server, #{
+    adapter => arizona_roadrunner_server,
+    proto_opts => #{protocols => [http1, http2]},
+    routes => [
+        {grpc, [chat_service], #{health => true, reflection => true}},
+        {live, ~"/", my_page, #{}},
+        {ws, ~"/ws", #{}}
+    ]
+}}
+```
+
+`Services` are `roadrunner_grpc_service` modules (see Roadrunner's
+[gRPC guide](https://github.com/arizona-framework/roadrunner/blob/main/docs/grpc.md)),
+and `Opts` takes the other `roadrunner_grpc:routes/1` options. The listener
+needs `http2` (or `http3`) in `protocols`; `[http1, http2]` serves both on one
+port, with or without TLS. `arizona_roadrunner_server`'s documentation covers
+route order and `body_buffering`.
+
 ## Modules
 
 | Module | Purpose |

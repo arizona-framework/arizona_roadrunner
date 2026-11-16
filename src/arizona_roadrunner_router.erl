@@ -6,10 +6,10 @@ The resulting compiled routes are stored in `persistent_term` under the
 listener-scoped key `{arizona_roadrunner_dispatch, Name}` -- one entry per
 listener, so `arizona_roadrunner_req:resolve_route/3` resolves a WS
 upgrade/navigate against the routes of the listener that accepted it, and two
-listeners do not clobber each other. Calling `compile_routes/3` again replaces
-the previous compiled set, which is how
-`arizona_roadrunner_server:recompile_routes/0` picks up new routes after a hot
-reload without restarting the listener.
+listeners do not clobber each other. A listener's start stores it with
+`compile_routes/3`; a hot reload (`arizona_roadrunner_server:recompile_routes/0`)
+builds the new set with `dispatch/2` and stores it with `put_dispatch/2` once the
+listener took its new routes, without restarting the listener.
 
 ## Route shapes
 
@@ -23,9 +23,18 @@ reload without restarting the listener.
 | `{match, Spec, Path, Handler, Opts}` | Multi/custom methods | `arizona_roadrunner_controller` |
 | `{mcp, Path, Handler, Opts}` | MCP server | `arizona_roadrunner_controller` |
 | `{reload, Path, Opts}` | Dev SSE reload endpoint | `arizona_roadrunner_controller` |
+| `{grpc, Services, Opts}` | gRPC services | `roadrunner_grpc` |
 
 `Verb` is `get`/`post`/`put`/`patch`/`delete`/`head`/`options`; `match`'s `Spec` is a
 single verb, a list of verbs, a custom uppercase method binary, or `'*'` (any method).
+
+A `{grpc, Services, Opts}` route is this adapter's own: core and other adapters
+refuse it as `unknown_route`. It expands to `roadrunner_grpc:routes/1` with
+`Services` as its `services`: one POST-only route per service at `/package.Service/:method`,
+plus the health and reflection services when `Opts` asks for them. `Opts` takes
+every other `roadrunner_grpc:routes/1` option, and runs no Arizona pipeline: a gRPC
+client sends no `Origin`, and gRPC compresses its own messages. A bad shape raises
+`invalid_grpc_route`. See `arizona_roadrunner_server` for what the listener needs.
 
 An `{asset, ...}` route answers GET and HEAD only (plus `OPTIONS` when it carries a
 CORS transform, for the preflight); any other method gets `405` + `Allow`.
@@ -51,6 +60,8 @@ so a listener start can build and validate its table before writing anything.
 %% --------------------------------------------------------------------
 
 -export([compile_routes/3]).
+-export([dispatch/2]).
+-export([put_dispatch/2]).
 -export([forget_routes/1]).
 -export([routes/1]).
 -export([routes/2]).
@@ -72,6 +83,8 @@ so a listener start can build and validate its table before writing anything.
 %% --------------------------------------------------------------------
 
 -export_type([route/0]).
+-export_type([grpc_service/0]).
+-export_type([grpc_opts/0]).
 
 %% --------------------------------------------------------------------
 %% Macros
@@ -85,8 +98,24 @@ so a listener start can build and validate its table before writing anything.
 %% Types definitions
 %% --------------------------------------------------------------------
 
-%% The routes this adapter serves: core's (`t:arizona_route:route/0`).
--nominal route() :: arizona_route:route().
+%% The routes this adapter serves: core's (`t:arizona_route:route/0`), and
+%% its own gRPC route.
+-nominal route() :: arizona_route:route() | {grpc, [grpc_service()], grpc_opts()}.
+
+%% A gRPC service: a `roadrunner_grpc_service` module, or a descriptor map of
+%% a service built at runtime.
+-nominal grpc_service() :: module() | roadrunner_grpc_service:descriptor().
+
+%% The options of `roadrunner_grpc:routes/1` other than `services`, which the
+%% route carries itself.
+-nominal grpc_opts() :: #{
+    codecs => [module()],
+    max_message_size => pos_integer(),
+    max_content_length => non_neg_integer(),
+    send_compression => roadrunner_grpc:encoding(),
+    health => boolean(),
+    reflection => boolean()
+}.
 
 %% --------------------------------------------------------------------
 %% API Functions
@@ -97,7 +126,7 @@ Compiles `Routes` into a roadrunner route table and stores it under the
 listener-scoped persistent term key `{arizona_roadrunner_dispatch, Name}`, so
 each listener's WS upgrade/navigate (`arizona_roadrunner_req:resolve_route/3`)
 resolves against its own routes. Replaces any previous compiled set atomically.
-This is the form the server boot/recompile path uses.
+This is the form a listener's start uses.
 
 `BuildOpts` threads build-time options through to per-route expansion:
 
@@ -110,11 +139,24 @@ This is the form the server boot/recompile path uses.
     BuildOpts :: map(),
     Name :: atom().
 compile_routes(Routes, BuildOpts, Name) when is_map(BuildOpts), is_atom(Name) ->
-    persistent_term:put(
-        {?DISPATCH_KEY, Name},
-        roadrunner_router:compile(routes(Routes, BuildOpts), [])
-    ),
-    ok.
+    put_dispatch(Name, dispatch(Routes, BuildOpts)).
+
+-doc """
+Compiles `Routes` into the table `compile_routes/3` stores, without storing it,
+so a caller can store it only once something else has succeeded.
+""".
+-spec dispatch(Routes, BuildOpts) -> roadrunner_router:compiled() when
+    Routes :: [route()],
+    BuildOpts :: map().
+dispatch(Routes, BuildOpts) when is_map(BuildOpts) ->
+    roadrunner_router:compile(routes(Routes, BuildOpts), []).
+
+-doc "Stores a table `dispatch/2` compiled as the listener `Name`'s dispatch.".
+-spec put_dispatch(Name, Dispatch) -> ok when
+    Name :: atom(),
+    Dispatch :: roadrunner_router:compiled().
+put_dispatch(Name, Dispatch) when is_atom(Name) ->
+    persistent_term:put({?DISPATCH_KEY, Name}, Dispatch).
 
 -doc """
 Erases the listener-scoped dispatch key written by `compile_routes/3`.
@@ -137,14 +179,14 @@ live and recompile flows share the same expansion logic.
 routes(Routes) ->
     routes(Routes, #{}).
 
--doc "Like `routes/1` with build-time opts (see `compile_routes/2`).".
+-doc "Like `routes/1` with build-time opts (see `compile_routes/3`).".
 -spec routes(Routes, BuildOpts) -> [roadrunner_router:route()] when
     Routes :: [route()],
     BuildOpts :: map().
 routes(Routes, BuildOpts) when is_map(BuildOpts) ->
     %% Roadrunner serves every route kind, so classifying only refuses a term
     %% that is no route, naming the valid shapes.
-    ok = lists:foreach(fun(R) -> true = is_atom(arizona_route:kind(R)) end, Routes),
+    ok = lists:foreach(fun check_route/1, Routes),
     open_cors_options(lists:flatmap(fun(R) -> route_to_roadrunner(R, BuildOpts) end, Routes)).
 
 -doc """
@@ -197,11 +239,33 @@ format_error(
             "the cors transform from route #~b.",
             [CorsPos, CorsPath, ShadowedPos, ShadowedPath, CorsPos, CorsPos]
         )
+    };
+format_error({invalid_grpc_route, Route}, [{_M, _F, _Args, _Info} | _]) ->
+    #{
+        general => io_lib:format(
+            "~0tp is not a gRPC route. A gRPC route is {grpc, Services, Opts}: "
+            "Services a list of roadrunner_grpc_service modules or descriptor maps, "
+            "Opts a map of the other roadrunner_grpc:routes/1 options (services "
+            "goes in the tuple, not in Opts).",
+            [Route]
+        )
     }.
 
 %% --------------------------------------------------------------------
 %% Internal functions
 %% --------------------------------------------------------------------
+
+%% The gRPC route is this adapter's own, so it is checked here: core's `kind/1`
+%% would refuse it as no route.
+check_route({grpc, Services, Opts}) when
+    is_list(Services), is_map(Opts), not is_map_key(services, Opts)
+->
+    ok;
+check_route({grpc, _Services, _Opts} = Route) ->
+    erlang:error({invalid_grpc_route, Route}, [Route], [{error_info, #{module => ?MODULE}}]);
+check_route(Route) ->
+    true = is_atom(arizona_route:kind(Route)),
+    ok.
 
 %% Arizona's per-route data lives under the `arizona` key inside the
 %% route's `state` so roadrunner's pipeline does not interpret arizona's
@@ -242,6 +306,11 @@ route_to_roadrunner({asset, Path, _Source, Opts} = Route, BuildOpts) ->
             state => asset_state(arizona_route:asset_dir(Route), Opts)
         })
     ];
+route_to_roadrunner({grpc, Services, Opts}, _BuildOpts) ->
+    %% gRPC is POST only. The allowlist also makes roadrunner refuse an earlier
+    %% route answering POST on these paths (`/:a/:b`, `/*rest`), which would
+    %% otherwise take every call.
+    [Route#{methods => [~"POST"]} || Route <- roadrunner_grpc:routes(Opts#{services => Services})];
 route_to_roadrunner(Route, BuildOpts) ->
     %% A controller (verb tag or `{match, ...}`), or the MCP or dev reload
     %% endpoint, which are ones too; `arizona_roadrunner_controller` runs

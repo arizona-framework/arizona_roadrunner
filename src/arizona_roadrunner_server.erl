@@ -70,7 +70,41 @@ arizona_roadrunner_server:start(arizona_http, #{
 
 Roadrunner negotiates the protocol per connection from the ALPN
 offer; HTTP/1.1 clients still work on the same listener. Default
-when `protocols` is omitted is `[http1]` (HTTP/1.1 only).
+when `protocols` is omitted is `[http1]` (HTTP/1.1 only). Without TLS,
+`[http1, http2]` serves HTTP/1.1 and prior-knowledge HTTP/2 (h2c) on one
+port, told apart by the HTTP/2 connection preface.
+
+## Serving gRPC
+
+A `{grpc, Services, Opts}` route (`arizona_roadrunner_router`) serves gRPC
+services beside the Arizona routes, on the same listener and port:
+
+```erlang
+arizona_roadrunner_server:start(arizona_http, #{
+    routes => [
+        {grpc, [chat_service], #{health => true, reflection => true}},
+        {live, ~"/", home_view, #{}},
+        {ws, ~"/ws", #{}}
+    ],
+    proto_opts => #{protocols => [http1, http2]}
+}).
+```
+
+- gRPC needs HTTP/2 or HTTP/3: a listener with a gRPC route and neither in
+  `protocols` refuses to start (`grpc_requires_http2`).
+- A gRPC route answers POST only, and routes match in order, so list it
+  first. An earlier route answering POST on every path of a service (`/:a/:b`,
+  `/*rest`, `/package.Service/:method`) makes the listener refuse to start
+  (`unreachable_route`); one answering POST on only some of them (a literal
+  `/package.Service/Method`, `/:a/Method`) silently takes those methods; one
+  answering GET only leaves the calls to the gRPC route.
+- `body_buffering` is a listener option. Under the default `auto`, unary and
+  server-streaming calls work, and a client or bidirectional stream sees its
+  requests only once the client has sent them all. `proto_opts =>
+  #{body_buffering => manual}` streams them as they arrive, and makes every
+  Arizona route on the listener read its request body as it arrives too.
+- The services are written against `roadrunner_grpc` (see roadrunner's gRPC
+  guide); a method reaches live views through `arizona_pubsub`.
 """.
 
 %% --------------------------------------------------------------------
@@ -187,7 +221,10 @@ Refreshes two tables in lockstep:
 Both must move together — otherwise WS navigate sees new routes
 while a fresh HTTP request still 404s against the listener's stale
 table. A stashed listener that is no longer running is skipped, so it
-cannot stop the others from reloading.
+cannot stop the others from reloading. A listener whose routes fail to
+rebuild (a gRPC service or a listener middleware the reload broke) keeps
+both tables as they were, and the failure is logged: the other listeners
+still reload, and so does the page.
 """.
 -spec recompile_routes() -> ok.
 recompile_routes() ->
@@ -195,9 +232,7 @@ recompile_routes() ->
     lists:foreach(
         fun
             ({{?ROUTES_KEY, Name}, {Routes, BuildOpts}}) ->
-                ok = arizona_roadrunner_router:compile_routes(Routes, BuildOpts, Name),
-                ListenerRoutes = arizona_roadrunner_router:routes(Routes, BuildOpts),
-                ok = reload_listener_routes(Name, ListenerRoutes);
+                recompile_listener(Name, Routes, BuildOpts);
             (_) ->
                 ok
         end,
@@ -224,6 +259,16 @@ format_error(tls_with_http_scheme, [{_M, _F, _Args, _Info} | _]) ->
         general =>
             "tls => [...] implies https; drop scheme => http (or drop tls) "
             "instead of serving the configured certs' traffic in cleartext"
+    };
+format_error({grpc_requires_http2, Protocols}, _ST) ->
+    #{
+        general =>
+            io_lib:format(
+                "a {grpc, ...} route needs HTTP/2 or HTTP/3, but the listener serves "
+                "~0tp: add http2 to proto_opts.protocols ([http1, http2] serves both "
+                "on one port). Over HTTP/1.1 every gRPC call is answered 505.",
+                [Protocols]
+            )
     };
 format_error({unsupported_transport_opt, Opt}, _ST) ->
     #{
@@ -269,7 +314,28 @@ start_new(Name, Opts0) ->
         },
         Opts
     ),
+    ok = check_grpc_protocols(Routes, maps:get(protocols, ListenerOpts, [http1])),
     start_listener(Name, ListenerOpts, {Routes, BuildOpts}).
+
+%% gRPC runs over HTTP/2 or HTTP/3 only: over HTTP/1.1 every call would be
+%% answered `505`, so a listener that serves neither refuses a gRPC route.
+check_grpc_protocols(Routes, Protocols) ->
+    case
+        lists:any(fun(Route) -> element(1, Route) =:= grpc end, Routes) andalso
+            not lists:any(fun carries_grpc/1, Protocols)
+    of
+        true ->
+            erlang:error(
+                {grpc_requires_http2, Protocols},
+                [Routes, Protocols],
+                [{error_info, #{module => ?MODULE}}]
+            );
+        false ->
+            ok
+    end.
+
+carries_grpc({Protocol, _Opts}) -> carries_grpc(Protocol);
+carries_grpc(Protocol) -> Protocol =:= http2 orelse Protocol =:= http3.
 
 %% The routes are written BEFORE the listener starts so its first WS upgrade
 %% already resolves, which is also why a failed start must put back whatever
@@ -305,6 +371,26 @@ restore_routes(Name, Previous) ->
 %% A listener can be gone while its stash survives (stopped behind
 %% `stop/1`'s back, or its supervisor gave up on it); one such listener must
 %% not abort the reload for every listener after it.
+%% Rebuilding the routes runs the app's own code (a gRPC service's `rpcs/0`
+%% through roadrunner's `init_route`, a listener middleware's `init/1`), so an
+%% edit can break it mid-session. That listener keeps its tables and the
+%% failure is logged, rather than the raise stopping the other listeners'
+%% reload and the reloader's broadcast. The dispatch is stored only once the
+%% listener took its new table, so the two never disagree.
+recompile_listener(Name, Routes, BuildOpts) ->
+    try
+        Dispatch = arizona_roadrunner_router:dispatch(Routes, BuildOpts),
+        ListenerRoutes = arizona_roadrunner_router:routes(Routes, BuildOpts),
+        ok = reload_listener_routes(Name, ListenerRoutes),
+        ok = arizona_roadrunner_router:put_dispatch(Name, Dispatch)
+    catch
+        Class:Reason:Stacktrace ->
+            logger:error(
+                "listener ~p keeps its routes: rebuilding them failed~n~ts",
+                [Name, erl_error:format_exception(Class, Reason, Stacktrace)]
+            )
+    end.
+
 reload_listener_routes(Name, ListenerRoutes) ->
     try
         roadrunner_listener:reload_routes(Name, ListenerRoutes)
