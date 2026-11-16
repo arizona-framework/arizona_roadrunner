@@ -99,10 +99,18 @@ arizona_roadrunner_server:start(arizona_http, #{
   `/package.Service/Method`, `/:a/Method`) silently takes those methods; one
   answering GET only leaves the calls to the gRPC route.
 - `body_buffering` is a listener option. Under the default `auto`, unary and
-  server-streaming calls work, and a client or bidirectional stream sees its
-  requests only once the client has sent them all. `proto_opts =>
-  #{body_buffering => manual}` streams them as they arrive, and makes every
-  Arizona route on the listener read its request body as it arrives too.
+  server-streaming calls work, a client or bidirectional stream sees its
+  requests only once the client has sent them all, and a call whose requests
+  total more than the listener's `max_content_length` is answered HTTP `413`.
+  `proto_opts => #{body_buffering => manual}` streams them as they arrive,
+  with no cap on a call's total by default (`max_message_size` still bounds
+  each message; the route's `max_content_length` option caps the total), and
+  makes every Arizona route on the listener read its request body as it
+  arrives too.
+- A gRPC route's `middlewares` are roadrunner middlewares (modules exporting
+  `call/3`, run before each call, which may refuse it with
+  `roadrunner_grpc:reject/3`), not the Arizona steps and transforms the other
+  route kinds take there.
 - The services are written against `roadrunner_grpc` (see roadrunner's gRPC
   guide); a method reaches live views through `arizona_pubsub`.
 """.

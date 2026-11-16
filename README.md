@@ -73,7 +73,9 @@ refuse it.
 
 `Services` are `roadrunner_grpc_service` modules (see Roadrunner's
 [gRPC guide](https://github.com/arizona-framework/roadrunner/blob/main/docs/grpc.md)),
-and `Opts` takes the other `roadrunner_grpc:routes/1` options. The listener
+and `Opts` takes the other `roadrunner_grpc:routes/1` options; its
+`middlewares` are roadrunner middlewares run around each call, not Arizona
+steps. The listener
 needs `http2` (or `http3`) in `protocols`; `[http1, http2]` serves both on one
 port, with or without TLS. `arizona_roadrunner_server`'s documentation covers
 route order and `body_buffering`.
