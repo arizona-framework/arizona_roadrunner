@@ -12,6 +12,7 @@ on the same listener and port as the Arizona routes.
 -export([expands_to_roadrunner_grpc_routes/1]).
 -export([serves_a_call_beside_an_arizona_route/1]).
 -export([passes_its_options_to_roadrunner/1]).
+-export([runs_its_middlewares_around_each_call/1]).
 -export([answers_http1_with_505/1]).
 -export([survives_a_route_recompile/1]).
 -export([streams_beside_a_manual_body_read/1]).
@@ -30,6 +31,7 @@ all() ->
         expands_to_roadrunner_grpc_routes,
         serves_a_call_beside_an_arizona_route,
         passes_its_options_to_roadrunner,
+        runs_its_middlewares_around_each_call,
         answers_http1_with_505,
         survives_a_route_recompile,
         streams_beside_a_manual_body_read,
@@ -79,6 +81,32 @@ passes_its_options_to_roadrunner(Config) when is_list(Config) ->
         %% HealthCheckResponse{status = SERVING}: field 1, varint 1.
         ?assertMatch({ok, <<8, 1>>, _}, unary(Port, ~"/grpc.health.v1.Health/Check", <<>>))
     end).
+
+%% The route's `middlewares` are roadrunner's, run before each call: one may
+%% reject it with a gRPC status the client reads.
+runs_its_middlewares_around_each_call(Config) when is_list(Config) ->
+    Port = pick_port(),
+    {ok, _} = arizona_roadrunner_server:start(grpc_mw, #{
+        transport_opts => [{port, Port}],
+        proto_opts => #{protocols => [http1, http2]},
+        routes => [
+            {grpc, [arizona_roadrunner_grpc_echo], #{
+                middlewares => [{arizona_roadrunner_grpc_key, ~"k1"}]
+            }}
+        ]
+    }),
+    try
+        ?assertMatch(
+            {error, {grpc, unauthenticated, ~"bad api key", _}},
+            unary(Port, ~"/test.Echo/Say", ~"hi")
+        ),
+        ?assertMatch(
+            {ok, ~"echo: hi", _},
+            unary(Port, ~"/test.Echo/Say", ~"hi", #{metadata => [{~"x-api-key", ~"k1"}]})
+        )
+    after
+        ok = arizona_roadrunner_server:stop(grpc_mw)
+    end.
 
 %% The gRPC path is `roadrunner_grpc`'s, not an Arizona route's: over
 %% HTTP/1.1 it answers 505, as gRPC needs HTTP/2.
@@ -406,9 +434,12 @@ recv_all(Sock, Acc) ->
 
 %% A unary call on a connection of its own.
 unary(Port, Path, Request) ->
+    unary(Port, Path, Request, #{}).
+
+unary(Port, Path, Request, Opts) ->
     {ok, Conn} = roadrunner_grpc_client:connect(~"localhost", Port, #{}),
     try
-        roadrunner_grpc_client:unary(Conn, Path, Request, #{timeout => 5000})
+        roadrunner_grpc_client:unary(Conn, Path, Request, Opts#{timeout => 5000})
     after
         ok = roadrunner_grpc_client:close(Conn)
     end.

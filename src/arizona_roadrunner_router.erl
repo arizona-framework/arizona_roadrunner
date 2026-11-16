@@ -33,7 +33,9 @@ refuse it as `unknown_route`. It expands to `roadrunner_grpc:routes/1` with
 `Services` as its `services`: one POST-only route per service at `/package.Service/:method`,
 plus the health and reflection services when `Opts` asks for them. `Opts` takes
 every other `roadrunner_grpc:routes/1` option, and runs no Arizona pipeline: a gRPC
-client sends no `Origin`, and gRPC compresses its own messages. A bad shape raises
+client sends no `Origin`, and gRPC compresses its own messages. Its `middlewares`
+are roadrunner's, run around each call (an API-key check rejecting with a gRPC
+status, say). A bad shape raises
 `invalid_grpc_route`. See `arizona_roadrunner_server` for what the listener needs.
 
 An `{asset, ...}` route answers GET and HEAD only (plus `OPTIONS` when it carries a
@@ -111,7 +113,8 @@ so a listener start can build and validate its table before writing anything.
 -nominal grpc_opts() :: #{
     codecs => [module()],
     max_message_size => pos_integer(),
-    max_content_length => non_neg_integer(),
+    max_content_length => roadrunner_router:body_limit(),
+    middlewares => roadrunner_middleware:middleware_list(),
     send_compression => roadrunner_grpc:encoding(),
     health => boolean(),
     reflection => boolean()
@@ -307,10 +310,7 @@ route_to_roadrunner({asset, Path, _Source, Opts} = Route, BuildOpts) ->
         })
     ];
 route_to_roadrunner({grpc, Services, Opts}, _BuildOpts) ->
-    %% gRPC is POST only. The allowlist also makes roadrunner refuse an earlier
-    %% route answering POST on these paths (`/:a/:b`, `/*rest`), which would
-    %% otherwise take every call.
-    [Route#{methods => [~"POST"]} || Route <- roadrunner_grpc:routes(Opts#{services => Services})];
+    roadrunner_grpc:routes(Opts#{services => Services});
 route_to_roadrunner(Route, BuildOpts) ->
     %% A controller (verb tag or `{match, ...}`), or the MCP or dev reload
     %% endpoint, which are ones too; `arizona_roadrunner_controller` runs
