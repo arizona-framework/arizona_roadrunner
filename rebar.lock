@@ -1,4 +1,4 @@
 [{<<"roadrunner">>,
   {git,"https://github.com/arizona-framework/roadrunner.git",
-       {ref,"87bceaea59b4f32e34a6096a5cb6c1a2d1003758"}},
+       {ref,"8980a6876fc4c827217de0ab287c71a32824d202"}},
   0}].

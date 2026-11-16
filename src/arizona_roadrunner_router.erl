@@ -6,10 +6,10 @@ The resulting compiled routes are stored in `persistent_term` under the
 listener-scoped key `{arizona_roadrunner_dispatch, Name}` -- one entry per
 listener, so `arizona_roadrunner_req:resolve_route/3` resolves a WS
 upgrade/navigate against the routes of the listener that accepted it, and two
-listeners do not clobber each other. Calling `compile_routes/3` again replaces
-the previous compiled set, which is how
-`arizona_roadrunner_server:recompile_routes/0` picks up new routes after a hot
-reload without restarting the listener.
+listeners do not clobber each other. A listener's start stores it with
+`compile_routes/3`; a hot reload (`arizona_roadrunner_server:recompile_routes/0`)
+builds the new set with `dispatch/2` and stores it with `put_dispatch/2` once the
+listener took its new routes, without restarting the listener.
 
 ## Route shapes
 
@@ -126,7 +126,7 @@ Compiles `Routes` into a roadrunner route table and stores it under the
 listener-scoped persistent term key `{arizona_roadrunner_dispatch, Name}`, so
 each listener's WS upgrade/navigate (`arizona_roadrunner_req:resolve_route/3`)
 resolves against its own routes. Replaces any previous compiled set atomically.
-This is the form the server boot/recompile path uses.
+This is the form a listener's start uses.
 
 `BuildOpts` threads build-time options through to per-route expansion:
 

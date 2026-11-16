@@ -69,22 +69,15 @@ expands_to_roadrunner_grpc_routes(Config) when is_list(Config) ->
 %% A gRPC call and a plain HTTP/1.1 request reach the same plain-TCP port.
 serves_a_call_beside_an_arizona_route(Config) when is_list(Config) ->
     with_listener(#{}, fun(Port) ->
-        {_Headers, Messages, Trailers, _C} = arizona_roadrunner_grpc_client:call(
-            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Echo/Say", [~"hi"]
-        ),
-        ?assertEqual([~"echo: hi"], Messages),
-        ?assertEqual({~"grpc-status", ~"0"}, lists:keyfind(~"grpc-status", 1, Trailers)),
+        ?assertMatch({ok, ~"echo: hi", _}, unary(Port, ~"/test.Echo/Say", ~"hi")),
         ?assertMatch({200, ~"hello"}, http1(Port, ~"GET", ~"/hello", <<>>))
     end).
 
 %% `health => true` reaches roadrunner: its health service answers SERVING.
 passes_its_options_to_roadrunner(Config) when is_list(Config) ->
     with_listener(#{}, fun(Port) ->
-        {_Headers, Messages, _Trailers, _C} = arizona_roadrunner_grpc_client:call(
-            arizona_roadrunner_grpc_client:open(Port), 1, ~"/grpc.health.v1.Health/Check", [<<>>]
-        ),
         %% HealthCheckResponse{status = SERVING}: field 1, varint 1.
-        ?assertEqual([<<8, 1>>], Messages)
+        ?assertMatch({ok, <<8, 1>>, _}, unary(Port, ~"/grpc.health.v1.Health/Check", <<>>))
     end).
 
 %% The gRPC path is `roadrunner_grpc`'s, not an Arizona route's: over
@@ -99,10 +92,7 @@ answers_http1_with_505(Config) when is_list(Config) ->
 survives_a_route_recompile(Config) when is_list(Config) ->
     with_listener(#{}, fun(Port) ->
         ok = arizona_roadrunner_server:recompile_routes(),
-        {_Headers, Messages, _Trailers, _C} = arizona_roadrunner_grpc_client:call(
-            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Echo/Say", [~"again"]
-        ),
-        ?assertEqual([~"echo: again"], Messages)
+        ?assertMatch({ok, ~"echo: again", _}, unary(Port, ~"/test.Echo/Say", ~"again"))
     end).
 
 %% Under `body_buffering => manual` a bidirectional call answers each request
@@ -110,17 +100,17 @@ survives_a_route_recompile(Config) when is_list(Config) ->
 %% its whole body.
 streams_beside_a_manual_body_read(Config) when is_list(Config) ->
     with_listener(#{body_buffering => manual}, fun(Port) ->
-        C0 = arizona_roadrunner_grpc_client:start(
-            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Echo/Chat", []
-        ),
-        C1 = arizona_roadrunner_grpc_client:send(
-            C0, 1, iolist_to_binary(roadrunner_grpc_frame:encode(false, ~"one"))
-        ),
-        %% Answered before the client ends its requests: the call streams.
-        {Data, C3} = first_data(C1, 1),
-        ?assertEqual([~"one"], arizona_roadrunner_grpc_client:messages(Data)),
-        C4 = arizona_roadrunner_grpc_client:finish(C3, 1),
-        {_Trailers, _C5} = arizona_roadrunner_grpc_client:trailers(C4, 1),
+        {ok, Conn} = roadrunner_grpc_client:connect(~"localhost", Port, #{}),
+        try
+            {ok, Stream} = roadrunner_grpc_client:stream(Conn, ~"/test.Echo/Chat"),
+            ok = roadrunner_grpc_client:send(Stream, ~"one"),
+            %% Answered before the client ends its requests: the call streams.
+            ?assertEqual({ok, ~"one"}, roadrunner_grpc_client:recv(Stream, 5000)),
+            ok = roadrunner_grpc_client:close_send(Stream),
+            ?assertMatch({eof, _}, roadrunner_grpc_client:recv(Stream, 5000))
+        after
+            ok = roadrunner_grpc_client:close(Conn)
+        end,
         ?assertMatch({200, ~"got: a body"}, http1(Port, ~"POST", ~"/body", ~"a body"))
     end).
 
@@ -208,37 +198,62 @@ answers_a_get_with_405(Config) when is_list(Config) ->
         ?assertMatch({405, _}, http1(Port, ~"GET", ~"/test.Echo/Say", <<>>))
     end).
 
-%% A dev hot reload runs the service's code again (roadrunner's `init_route`).
-%% An edit that breaks it fails that listener's rebuild only: it keeps the
-%% table it had and serves on, the failure is logged, and the reload goes on,
-%% so the browser is still told. Fixing the edit rebuilds it on the next one.
+%% A dev hot reload runs the services' code again (roadrunner's `init_route`).
+%% An edit that breaks one fails the rebuild of each listener serving it, and
+%% of that listener only: it keeps its tables and serves on, each failure is
+%% logged, and every other listener still reloads (so does the page). Fixing the
+%% edit rebuilds it on the next reload.
 a_broken_service_edit_keeps_the_listener_reloadable(Config) when is_list(Config) ->
-    ok = load_service(Config, [{say, say}]),
+    ok = load_service(Config, arizona_roadrunner_grpc_reloaded, [{say, say}]),
+    ok = load_service(Config, arizona_roadrunner_grpc_reloaded_b, [{say, say}]),
+    Start = fun(Name, Service) ->
+        Port = pick_port(),
+        {ok, _} = arizona_roadrunner_server:start(Name, #{
+            transport_opts => [{port, Port}],
+            proto_opts => #{protocols => [http1, http2]},
+            routes => [{grpc, [Service], #{}}]
+        }),
+        Port
+    end,
+    PortA = Start(grpc_reload_a, arizona_roadrunner_grpc_reloaded),
+    _PortB = Start(grpc_reload_b, arizona_roadrunner_grpc_reloaded_b),
+    _PortC = Start(grpc_reload_c, arizona_roadrunner_grpc_reloaded),
     ok = logger:add_handler(grpc_reload_probe, ?MODULE, #{config => #{pid => self()}}),
-    Port = pick_port(),
-    {ok, _} = arizona_roadrunner_server:start(grpc_reload, #{
-        transport_opts => [{port, Port}],
-        proto_opts => #{protocols => [http1, http2]},
-        routes => [{grpc, [arizona_roadrunner_grpc_reloaded], #{}}]
-    }),
     try
-        %% Its `rpcs/0` now names a function the module does not export.
-        ok = load_service(Config, [{say, gone}]),
+        Before = #{Name => tables(Name) || Name <- [grpc_reload_a, grpc_reload_b, grpc_reload_c]},
+        %% A and C's service now names a function it does not export; B's gains
+        %% a method.
+        ok = load_service(Config, arizona_roadrunner_grpc_reloaded, [{say, gone}]),
+        ok = load_service(Config, arizona_roadrunner_grpc_reloaded_b, [{say, say}, {extra, say}]),
         ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
-        receive
-            {logged, error, Message} ->
-                ?assertNotEqual(nomatch, binary:match(Message, ~"grpc_reload"))
-        after 5000 -> error(no_error_logged)
-        end,
-        {_Headers, Messages, _Trailers, _C} = arizona_roadrunner_grpc_client:call(
-            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Reloaded/Say", [~"still"]
-        ),
-        ?assertEqual([~"still"], Messages),
-        ok = load_service(Config, [{say, say}]),
-        ?assertEqual(ok, arizona_roadrunner_server:recompile_routes())
+        ?assertEqual([grpc_reload_a, grpc_reload_c], lists:sort(logged_listeners([]))),
+        ?assertEqual(maps:get(grpc_reload_a, Before), tables(grpc_reload_a)),
+        ?assertEqual(maps:get(grpc_reload_c, Before), tables(grpc_reload_c)),
+        {DispatchB, ListenerB} = maps:get(grpc_reload_b, Before),
+        {DispatchB1, ListenerB1} = tables(grpc_reload_b),
+        ?assertNotEqual(DispatchB, DispatchB1),
+        ?assertNotEqual(ListenerB, ListenerB1),
+        ?assertMatch({ok, ~"still", _}, unary(PortA, ~"/test.Reloaded/Say", ~"still")),
+        ok = load_service(Config, arizona_roadrunner_grpc_reloaded, [{say, say}, {extra, say}]),
+        ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
+        ?assertNotEqual(maps:get(grpc_reload_a, Before), tables(grpc_reload_a))
     after
-        ok = arizona_roadrunner_server:stop(grpc_reload),
-        ok = logger:remove_handler(grpc_reload_probe)
+        ok = logger:remove_handler(grpc_reload_probe),
+        [
+            ok = arizona_roadrunner_server:stop(N)
+         || N <- [grpc_reload_a, grpc_reload_b, grpc_reload_c]
+        ]
+    end.
+
+%% The listeners named in the errors logged so far.
+logged_listeners(Acc) ->
+    receive
+        {logged, error, Message} ->
+            {match, [Name]} = re:run(Message, ~"^listener (\\S+) keeps its routes", [
+                {capture, all_but_first, binary}
+            ]),
+            logged_listeners([binary_to_atom(Name) | Acc])
+    after 1000 -> Acc
     end.
 
 %% A listener middleware's `init/1` runs only as roadrunner rebuilds the
@@ -246,7 +261,7 @@ a_broken_service_edit_keeps_the_listener_reloadable(Config) when is_list(Config)
 %% (what a live navigate resolves against) is not moved on alone: both keep
 %% the routes they had, and move together once the edit is fixed.
 a_broken_middleware_edit_keeps_both_tables(Config) when is_list(Config) ->
-    ok = load_service(Config, [{say, say}]),
+    ok = load_service(Config, arizona_roadrunner_grpc_reloaded, [{say, say}]),
     ok = load_middleware(Config, ~"ok"),
     {ok, _} = arizona_roadrunner_server:start(grpc_mw_reload, #{
         transport_opts => [{port, pick_port()}],
@@ -258,7 +273,7 @@ a_broken_middleware_edit_keeps_both_tables(Config) when is_list(Config) ->
     try
         Before = tables(grpc_mw_reload),
         %% The service gains a method, and the middleware's `init/1` now raises.
-        ok = load_service(Config, [{say, say}, {extra, say}]),
+        ok = load_service(Config, arizona_roadrunner_grpc_reloaded, [{say, say}, {extra, say}]),
         ok = load_middleware(Config, ~"error(broken)"),
         ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
         ?assertEqual(Before, tables(grpc_mw_reload)),
@@ -295,10 +310,10 @@ log(#{level := Level, msg := Msg}, #{config := #{pid := Pid}}) ->
 %% Helpers
 %% --------------------------------------------------------------------
 
-%% (Re)load `arizona_roadrunner_grpc_reloaded`, a raw-codec service with a
-%% method per `{Method, Function}` pair; only `say/2` (an echo) is exported, so
-%% naming any other function breaks the service.
-load_service(Config, Methods) ->
+%% (Re)load `Module`, a raw-codec service named after it with a method per
+%% `{Method, Function}` pair; only `say/2` (an echo) is exported, so naming any
+%% other function breaks the service.
+load_service(Config, Module, Methods) ->
     Rpcs = lists:join(~", ", [
         io_lib:format(
             "<<\"~ts\">> => #{function => ~s, kind => unary, input => b, output => b}",
@@ -306,9 +321,14 @@ load_service(Config, Methods) ->
         )
      || {M, F} <- Methods
     ]),
-    load(Config, arizona_roadrunner_grpc_reloaded, [
+    Name =
+        case Module of
+            arizona_roadrunner_grpc_reloaded -> "test.Reloaded";
+            arizona_roadrunner_grpc_reloaded_b -> "test.ReloadedB"
+        end,
+    load(Config, Module, [
         "-export([name/0, rpcs/0, say/2]).\n",
-        "name() -> <<\"test.Reloaded\">>.\n",
+        ["name() -> <<\"", Name, "\">>.\n"],
         ["rpcs() -> #{", Rpcs, "}.\n"],
         "say(Message, Stream) -> {reply, Message, Stream}.\n"
     ]).
@@ -384,12 +404,13 @@ recv_all(Sock, Acc) ->
         {error, closed} -> Acc
     end.
 
-%% The first DATA frame the server sends on `StreamId`, skipping the frames
-%% before it (settings, window updates, the response headers).
-first_data(C0, StreamId) ->
-    case arizona_roadrunner_grpc_client:next_frame(C0) of
-        {{data, StreamId, _Flags, Data, _FlowLen}, C} -> {Data, C};
-        {_Other, C} -> first_data(C, StreamId)
+%% A unary call on a connection of its own.
+unary(Port, Path, Request) ->
+    {ok, Conn} = roadrunner_grpc_client:connect(~"localhost", Port, #{}),
+    try
+        roadrunner_grpc_client:unary(Conn, Path, Request, #{timeout => 5000})
+    after
+        ok = roadrunner_grpc_client:close(Conn)
     end.
 
 %% The message `erl_error` renders for what `Fun` raises.
