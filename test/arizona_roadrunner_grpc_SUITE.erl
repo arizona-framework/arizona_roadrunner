@@ -131,6 +131,9 @@ refuses_an_arizona_middleware_at_start(Config) when is_list(Config) ->
     ],
     ?assertEqual(
         undefined, persistent_term:get({arizona_roadrunner_routes, grpc_bad_mw}, undefined)
+    ),
+    ?assertEqual(
+        undefined, persistent_term:get({arizona_roadrunner_dispatch, grpc_bad_mw}, undefined)
     ).
 
 %% The gRPC path is `roadrunner_grpc`'s, not an Arizona route's: over
