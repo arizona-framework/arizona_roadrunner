@@ -229,9 +229,7 @@ recompile_routes() ->
     lists:foreach(
         fun
             ({{?ROUTES_KEY, Name}, {Routes, BuildOpts}}) ->
-                ok = arizona_roadrunner_router:compile_routes(Routes, BuildOpts, Name),
-                ListenerRoutes = arizona_roadrunner_router:routes(Routes, BuildOpts),
-                ok = reload_listener_routes(Name, ListenerRoutes);
+                recompile_listener(Name, Routes, BuildOpts);
             (_) ->
                 ok
         end,
@@ -370,6 +368,25 @@ restore_routes(Name, Previous) ->
 %% A listener can be gone while its stash survives (stopped behind
 %% `stop/1`'s back, or its supervisor gave up on it); one such listener must
 %% not abort the reload for every listener after it.
+%% Building a route can run the app's own code (a gRPC service's `rpcs/0`,
+%% through roadrunner's `init_route`), so an edit can break it mid-session.
+%% That listener keeps the table it has and the failure is logged, rather than
+%% the raise stopping the other listeners' reload and the reloader's broadcast.
+%% That code runs as the dispatch table is built, before either table is
+%% written, so the two stay in step.
+recompile_listener(Name, Routes, BuildOpts) ->
+    try
+        ok = arizona_roadrunner_router:compile_routes(Routes, BuildOpts, Name),
+        ListenerRoutes = arizona_roadrunner_router:routes(Routes, BuildOpts),
+        ok = reload_listener_routes(Name, ListenerRoutes)
+    catch
+        Class:Reason:Stacktrace ->
+            logger:error(
+                "listener ~p keeps its routes: rebuilding them failed~n~ts",
+                [Name, erl_error:format_exception(Class, Reason, Stacktrace)]
+            )
+    end.
+
 reload_listener_routes(Name, ListenerRoutes) ->
     try
         roadrunner_listener:reload_routes(Name, ListenerRoutes)

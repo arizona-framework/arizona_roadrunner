@@ -21,6 +21,8 @@ on the same listener and port as the Arizona routes.
 -export([counts_http3_as_carrying_grpc/1]).
 -export([refuses_an_earlier_post_catch_all/1]).
 -export([answers_a_get_with_405/1]).
+-export([a_broken_service_edit_keeps_the_listener_reloadable/1]).
+-export([log/2]).
 
 all() ->
     [
@@ -35,7 +37,8 @@ all() ->
         accepts_http2_with_options,
         counts_http3_as_carrying_grpc,
         refuses_an_earlier_post_catch_all,
-        answers_a_get_with_405
+        answers_a_get_with_405,
+        a_broken_service_edit_keeps_the_listener_reloadable
     ].
 
 init_per_suite(Config) ->
@@ -203,9 +206,79 @@ answers_a_get_with_405(Config) when is_list(Config) ->
         ?assertMatch({405, _}, http1(Port, ~"GET", ~"/test.Echo/Say", <<>>))
     end).
 
+%% A dev hot reload runs the service's code again (roadrunner's `init_route`).
+%% An edit that breaks it fails that listener's rebuild only: it keeps the
+%% table it had and serves on, the failure is logged, and the reload goes on,
+%% so the browser is still told. Fixing the edit rebuilds it on the next one.
+a_broken_service_edit_keeps_the_listener_reloadable(Config) when is_list(Config) ->
+    ok = load_service(Config, say),
+    ok = logger:add_handler(grpc_reload_probe, ?MODULE, #{config => #{pid => self()}}),
+    Port = pick_port(),
+    {ok, _} = arizona_roadrunner_server:start(grpc_reload, #{
+        transport_opts => [{port, Port}],
+        proto_opts => #{protocols => [http1, http2]},
+        routes => [{grpc, [arizona_roadrunner_grpc_reloaded], #{}}]
+    }),
+    try
+        %% Its `rpcs/0` now names a function the module does not export.
+        ok = load_service(Config, gone),
+        ?assertEqual(ok, arizona_roadrunner_server:recompile_routes()),
+        receive
+            {logged, error, Message} ->
+                ?assertNotEqual(nomatch, binary:match(Message, ~"grpc_reload"))
+        after 5000 -> error(no_error_logged)
+        end,
+        {_Headers, Messages, _Trailers, _C} = arizona_roadrunner_grpc_client:call(
+            arizona_roadrunner_grpc_client:open(Port), 1, ~"/test.Reloaded/Say", [~"still"]
+        ),
+        ?assertEqual([~"still"], Messages),
+        ok = load_service(Config, say),
+        ?assertEqual(ok, arizona_roadrunner_server:recompile_routes())
+    after
+        ok = arizona_roadrunner_server:stop(grpc_reload),
+        ok = logger:remove_handler(grpc_reload_probe)
+    end.
+
+%% A logger handler forwarding each event's level and rendered message.
+log(#{level := Level, msg := Msg}, #{config := #{pid := Pid}}) ->
+    Text =
+        case Msg of
+            {string, String} -> String;
+            {report, Report} -> io_lib:format("~0tp", [Report]);
+            {Format, Args} -> io_lib:format(Format, Args)
+        end,
+    Pid ! {logged, Level, unicode:characters_to_binary(Text)},
+    ok.
+
 %% --------------------------------------------------------------------
 %% Helpers
 %% --------------------------------------------------------------------
+
+%% (Re)load `arizona_roadrunner_grpc_reloaded`, a raw-codec service whose `Say`
+%% method runs `Function`: `say` echoes the request, `gone` is not exported.
+load_service(Config, Function) ->
+    File = filename:join(
+        proplists:get_value(priv_dir, Config), "arizona_roadrunner_grpc_reloaded.erl"
+    ),
+    ok = file:write_file(
+        File,
+        io_lib:format(
+            "-module(arizona_roadrunner_grpc_reloaded).~n"
+            "-export([name/0, rpcs/0, say/2]).~n"
+            "name() -> <<\"test.Reloaded\">>.~n"
+            "rpcs() -> #{<<\"Say\">> =>~n"
+            "    #{function => ~s, kind => unary, input => b, output => b}}.~n"
+            "say(Message, Stream) -> {reply, Message, Stream}.~n",
+            [Function]
+        )
+    ),
+    {ok, Module, Beam} = compile:file(File, [binary]),
+    case code:purge(Module) of
+        true -> ok;
+        false -> ok
+    end,
+    {module, Module} = code:load_binary(Module, File, Beam),
+    ok.
 
 %% A plain-TCP listener serving HTTP/1.1 and prior-knowledge HTTP/2, with the
 %% echo service before an Arizona controller.
