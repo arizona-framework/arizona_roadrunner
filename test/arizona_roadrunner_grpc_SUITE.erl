@@ -13,6 +13,7 @@ on the same listener and port as the Arizona routes.
 -export([serves_a_call_beside_an_arizona_route/1]).
 -export([passes_its_options_to_roadrunner/1]).
 -export([runs_its_middlewares_around_each_call/1]).
+-export([refuses_an_arizona_middleware_at_start/1]).
 -export([answers_http1_with_505/1]).
 -export([survives_a_route_recompile/1]).
 -export([streams_beside_a_manual_body_read/1]).
@@ -32,6 +33,7 @@ all() ->
         serves_a_call_beside_an_arizona_route,
         passes_its_options_to_roadrunner,
         runs_its_middlewares_around_each_call,
+        refuses_an_arizona_middleware_at_start,
         answers_http1_with_505,
         survives_a_route_recompile,
         streams_beside_a_manual_body_read,
@@ -107,6 +109,32 @@ runs_its_middlewares_around_each_call(Config) when is_list(Config) ->
     after
         ok = arizona_roadrunner_server:stop(grpc_mw)
     end.
+
+%% A gRPC route's middlewares are roadrunner's. An Arizona step put there by
+%% mistake stops the listener at start, naming it, instead of failing every
+%% call; nothing is left behind.
+refuses_an_arizona_middleware_at_start(Config) when is_list(Config) ->
+    [
+        ?assertError(
+            {invalid_middleware, Entry, _Reason},
+            arizona_roadrunner_server:start(grpc_bad_mw, #{
+                transport_opts => [{port, pick_port()}],
+                proto_opts => #{protocols => [http1, http2]},
+                routes => [{grpc, [arizona_roadrunner_grpc_echo], #{middlewares => [Entry]}}]
+            })
+        )
+     || Entry <- [
+            {arizona_middleware, check_origin},
+            fun(Req, Bindings) -> {Req, Bindings} end,
+            arizona_middleware:etag()
+        ]
+    ],
+    ?assertEqual(
+        undefined, persistent_term:get({arizona_roadrunner_routes, grpc_bad_mw}, undefined)
+    ),
+    ?assertEqual(
+        undefined, persistent_term:get({arizona_roadrunner_dispatch, grpc_bad_mw}, undefined)
+    ).
 
 %% The gRPC path is `roadrunner_grpc`'s, not an Arizona route's: over
 %% HTTP/1.1 it answers 505, as gRPC needs HTTP/2.

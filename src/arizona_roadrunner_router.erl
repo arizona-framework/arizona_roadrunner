@@ -114,7 +114,7 @@ so a listener start can build and validate its table before writing anything.
     codecs => [module()],
     max_message_size => pos_integer(),
     max_content_length => roadrunner_router:body_limit(),
-    middlewares => roadrunner_middleware:middleware_list(),
+    middlewares => roadrunner_middleware:middlewares(),
     send_compression => roadrunner_grpc:encoding(),
     health => boolean(),
     reflection => boolean()
