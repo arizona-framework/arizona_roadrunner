@@ -92,8 +92,11 @@ arizona_roadrunner_server:start(arizona_http, #{
 
 - gRPC needs HTTP/2 or HTTP/3: a listener with a gRPC route and neither in
   `protocols` refuses to start (`grpc_requires_http2`).
-- List the gRPC route before any catch-all route: routes match in order, and
-  roadrunner refuses a route an earlier one shadows.
+- A gRPC route answers POST only. Routes match in order, so list it before
+  any route whose path also matches `/package.Service/method` (`/:a/:b`,
+  `/*rest`): one that answers POST there shadows it and the listener refuses
+  to start (`unreachable_route`), one that answers GET only leaves the calls
+  to the gRPC route.
 - `body_buffering` is a listener option. Under the default `auto`, unary and
   server-streaming calls work, and a client or bidirectional stream sees its
   requests only once the client has sent them all. `proto_opts =>

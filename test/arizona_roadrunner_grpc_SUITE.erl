@@ -17,6 +17,10 @@ on the same listener and port as the Arizona routes.
 -export([streams_beside_a_manual_body_read/1]).
 -export([refuses_a_listener_without_http2/1]).
 -export([refuses_a_bad_shape/1]).
+-export([accepts_http2_with_options/1]).
+-export([counts_http3_as_carrying_grpc/1]).
+-export([refuses_an_earlier_post_catch_all/1]).
+-export([answers_a_get_with_405/1]).
 
 all() ->
     [
@@ -27,7 +31,11 @@ all() ->
         survives_a_route_recompile,
         streams_beside_a_manual_body_read,
         refuses_a_listener_without_http2,
-        refuses_a_bad_shape
+        refuses_a_bad_shape,
+        accepts_http2_with_options,
+        counts_http3_as_carrying_grpc,
+        refuses_an_earlier_post_catch_all,
+        answers_a_get_with_405
     ].
 
 init_per_suite(Config) ->
@@ -148,6 +156,55 @@ refuses_a_bad_shape(Config) when is_list(Config) ->
     ?assertEqual(undefined, persistent_term:get({arizona_roadrunner_routes, grpc_bad}, undefined)),
     Message = format(fun() -> Start({grpc, arizona_roadrunner_grpc_echo, #{}}) end),
     ?assertNotEqual(nomatch, binary:match(Message, ~"is not a gRPC route")).
+
+%% A protocol given with its options (`{http2, Opts}`) carries gRPC too.
+accepts_http2_with_options(Config) when is_list(Config) ->
+    {ok, _} = arizona_roadrunner_server:start(grpc_h2_opts, #{
+        transport_opts => [{port, pick_port()}],
+        proto_opts => #{protocols => [http1, {http2, #{}}]},
+        routes => [{grpc, [arizona_roadrunner_grpc_echo], #{}}]
+    }),
+    ok = arizona_roadrunner_server:stop(grpc_h2_opts).
+
+%% HTTP/3 carries gRPC, so a listener offering it passes the gRPC check and
+%% fails only on roadrunner's own rule that HTTP/3 needs TLS.
+counts_http3_as_carrying_grpc(Config) when is_list(Config) ->
+    Error =
+        try
+            arizona_roadrunner_server:start(grpc_h3, #{
+                transport_opts => [{port, pick_port()}],
+                proto_opts => #{protocols => [http1, http3]},
+                routes => [{grpc, [arizona_roadrunner_grpc_echo], #{}}]
+            })
+        catch
+            error:Reason -> Reason
+        end,
+    ?assertNotMatch({grpc_requires_http2, _}, Error).
+
+%% An earlier route answering POST on every two-segment path would take every
+%% gRPC call; the listener refuses to start instead.
+refuses_an_earlier_post_catch_all(Config) when is_list(Config) ->
+    [
+        ?assertError(
+            {unreachable_route, _, _, _},
+            arizona_roadrunner_server:start(grpc_shadowed, #{
+                transport_opts => [{port, pick_port()}],
+                proto_opts => #{protocols => [http1, http2]},
+                routes => [
+                    {post, Path, arizona_roadrunner_grpc_body, #{state => #{prefix => <<>>}}},
+                    {grpc, [arizona_roadrunner_grpc_echo], #{}}
+                ]
+            })
+        )
+     || Path <- [~"/:a/:b", ~"/*rest"]
+    ],
+    ok.
+
+%% A gRPC path answers POST only: the router turns a GET away with 405.
+answers_a_get_with_405(Config) when is_list(Config) ->
+    with_listener(#{}, fun(Port) ->
+        ?assertMatch({405, _}, http1(Port, ~"GET", ~"/test.Echo/Say", <<>>))
+    end).
 
 %% --------------------------------------------------------------------
 %% Helpers

@@ -292,7 +292,10 @@ route_to_roadrunner({asset, Path, _Source, Opts} = Route, BuildOpts) ->
         })
     ];
 route_to_roadrunner({grpc, Services, Opts}, _BuildOpts) ->
-    roadrunner_grpc:routes(Opts#{services => Services});
+    %% gRPC is POST only. The allowlist also makes roadrunner refuse an earlier
+    %% route answering POST on these paths (`/:a/:b`, `/*rest`), which would
+    %% otherwise take every call.
+    [Route#{methods => [~"POST"]} || Route <- roadrunner_grpc:routes(Opts#{services => Services})];
 route_to_roadrunner(Route, BuildOpts) ->
     %% A controller (verb tag or `{match, ...}`), or the MCP or dev reload
     %% endpoint, which are ones too; `arizona_roadrunner_controller` runs
