@@ -110,7 +110,8 @@ arizona_roadrunner_server:start(arizona_http, #{
 - A gRPC route's `middlewares` are roadrunner middlewares (modules exporting
   `call/3`, run before each call, which may refuse it with
   `roadrunner_grpc:reject/3`), not the Arizona steps and transforms the other
-  route kinds take there.
+  route kinds take there. Any other entry stops the listener at start
+  (`invalid_middleware`).
 - The services are written against `roadrunner_grpc` (see roadrunner's gRPC
   guide); a method reaches live views through `arizona_pubsub`.
 """.
